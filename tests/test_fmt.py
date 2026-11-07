@@ -71,6 +71,16 @@ def test_short_path_home(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fmt.short_path("/opt/toolkit") == "opt"
 
 
+def test_human_size() -> None:
+    assert fmt.human_size(None) == "—"
+    assert fmt.human_size(-5) == "—"
+    assert fmt.human_size(0) == "0 B"
+    assert fmt.human_size(512) == "512 B"
+    assert fmt.human_size(2048) == "2,0 KB"
+    assert fmt.human_size(12_000_000) == "11,4 MB"
+    assert fmt.human_size(3_500_000_000) == "3,3 GB"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="drive de disco é coisa do Windows")
 def test_short_path_drive_windows() -> None:
     # repos fora da home do usuário: G:\Dev\north → G:\…

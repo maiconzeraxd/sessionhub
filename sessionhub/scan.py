@@ -50,6 +50,9 @@ def run_scan(
         stats.errors += result.errors
         sessions.extend(result.sessions)
         seen_by_harness[scanner.name] = result.seen
+        # /rename em arquivo inalterado: título novo sem re-parse
+        if result.renames:
+            db.update_titles(scanner.name, result.renames)
 
     # ---- repos/worktrees ------------------------------------------------
     cwd_to_wt: dict[str, str | None] = {}

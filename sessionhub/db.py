@@ -206,6 +206,24 @@ class Database:
             )
         return len(rows)
 
+    def update_titles(self, harness: str, titles: dict[str, str]) -> int:
+        """Aplica títulos custom (/rename) a sessões já indexadas.
+
+        Para arquivos inalterados cujo /rename mudou: um UPDATE pontual,
+        sem re-parsear o transcript nem tocar nos outros campos.
+        """
+        if not titles:
+            return 0
+        n = 0
+        with self.conn:
+            for path, title in titles.items():
+                cur = self.conn.execute(
+                    "UPDATE sessions SET title = ? WHERE harness = ? AND transcript_path = ?",
+                    (title, harness, path),
+                )
+                n += cur.rowcount or 0
+        return n
+
     def get_fingerprints(self, harness: str) -> dict[str, tuple[float, int]]:
         """transcript_path -> (mtime, size), para pular arquivos inalterados."""
         rows = self.conn.execute(

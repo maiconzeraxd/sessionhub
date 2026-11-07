@@ -18,6 +18,13 @@ from sessionhub.scanners.claude import ClaudeScanner
 SID = "11111111-2222-3333-4444-555555555555"
 
 
+def _write_custom_title(projects: Path, sid: str, content: str) -> None:
+    """Grava custom-title.json na pasta irmã do transcript (layout do /rename)."""
+    d = projects / sid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "custom-title.json").write_text(content, encoding="utf-8")
+
+
 def test_parses_sessao_basica(fake_home: Path) -> None:
     projects = fake_home / ".claude" / "projects" / "G--proj"
     write_transcript(
@@ -263,6 +270,47 @@ def test_diagnose_origem_vazia_e_problema(fake_home: Path) -> None:
     assert diag.files == 0
     assert diag.note is not None
     assert diag.problem is True
+
+
+# ------------------------------------------------------------- /rename (título custom)
+
+
+def test_rename_vence_primeira_mensagem(fake_home: Path) -> None:
+    """custom-title.json do /rename tem prioridade sobre a 1ª mensagem."""
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, "G:\\proj", "primeira msg")])
+    _write_custom_title(projects, SID, '{"customTitle":"meu nome"}')
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title == "meu nome"
+
+
+def test_rename_em_arquivo_inalterado_vai_sem_reparse(fake_home: Path) -> None:
+    """Scan incremental: jsonl não mudou → só o título novo é reportado."""
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    fp = write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, "G:\\proj", "msg")])
+    stat = fp.stat()
+    fingerprints = {str(fp): (stat.st_mtime, stat.st_size)}
+
+    result = ClaudeScanner(fake_home).discover(fingerprints)
+    assert result.sessions == []
+    assert result.renames == {}
+
+    # /rename chegou DEPOIS da indexação (transcript intacto)
+    _write_custom_title(projects, SID, '{"customTitle":"renomeada"}')
+    result = ClaudeScanner(fake_home).discover(fingerprints)
+    assert result.sessions == []  # nada foi re-parseado
+    assert result.renames == {str(fp): "renomeada"}
+
+
+def test_rename_corrompido_ou_vazio_ignorado(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, "G:\\proj", "msg")])
+
+    _write_custom_title(projects, SID, "não é json")
+    assert ClaudeScanner(fake_home).discover().sessions[0].title == "msg"
+
+    _write_custom_title(projects, SID, '{"customTitle":"   "}')
+    assert ClaudeScanner(fake_home).discover().sessions[0].title == "msg"
 
 
 def test_dedup_mesmo_stem_em_pastas_diferentes(fake_home: Path) -> None:

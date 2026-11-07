@@ -106,8 +106,9 @@ def test_preview_markdown(fake_home: Path) -> None:
     assert "claude --resume" in md
     assert "✎ 3" in md and "↑1" in md
     assert "👤 você" in md
-    # conversa longa: o primeiro cai fora do tail → seção própria
-    assert "Pedido inicial" in md
+    assert "**tamanho:**" in md  # tamanho do transcript no cabeçalho
+    # ordem: últimas mensagens primeiro, pedido inicial no fim
+    assert md.index("Últimas mensagens") < md.index("Pedido inicial")
     assert "pergunta de teste" in md
     assert "> pergunta 2\n" not in md  # caíram fora das últimas 25
 

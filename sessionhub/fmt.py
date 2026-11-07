@@ -80,6 +80,23 @@ def display_title(row: Mapping[str, Any], max_chars: int = 60) -> str:
     return title if len(title) <= max_chars else title[: max_chars - 3] + "…"
 
 
+# ------------------------------------------------------------- tamanhos
+
+
+def human_size(nbytes: int | float | None) -> str:
+    """Bytes → legível: 512 B · 2,0 KB · 11,4 MB · 1,2 GB (— se nulo)."""
+    if nbytes is None or nbytes < 0:
+        return "—"
+    value = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}".replace(".", ",")
+        value /= 1024
+    return "?"  # pragma: no cover - inalcançável (TB fecha o loop)
+
+
 # ------------------------------------------------------------- caminhos
 
 

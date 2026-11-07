@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from helpers import make_assistant_line, make_user_line, write_transcript
 from textual.widgets import Input, Tree
 
 from sessionhub.config import Config
@@ -218,6 +219,42 @@ async def test_tui_clique_unico_navega_duplo_abre(
         await asyncio.sleep(0.1)  # abrir roda em thread
         await pilot.pause()
         assert opened == [SID]
+
+
+async def test_tui_clique_unico_mostra_ultimas_mensagens(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    """Clique único → preview abre nas ÚLTIMAS mensagens, com tamanho."""
+    _fill_db(db, tmp_path)
+    lines = [make_user_line(SID, str(tmp_path), "pedido inicial antigo")]
+    for i in range(25):  # o tail guarda 25 — a primeira cai fora
+        lines.append(make_user_line(SID, str(tmp_path), f"enchimento {i}"))
+    lines.append(make_user_line(SID, str(tmp_path), "última pergunta", ts="2026-11-01T11:00:00Z"))
+    lines.append(make_assistant_line(SID, str(tmp_path), "última resposta", "2026-11-01T11:00:30Z"))
+    write_transcript(tmp_path / "t.jsonl", lines)
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tree = app.query_one("#tree", SessionTree)
+        target = None
+        for line in range(tree.last_line + 1):
+            node = tree.get_node_at_line(line)
+            data = getattr(node, "data", None)
+            if isinstance(data, NodeData) and data.kind == "session":
+                target = line
+                break
+        assert target is not None
+
+        await tree._on_click(_StubClick(target, 1))  # clique único
+        await asyncio.sleep(0.3)  # debounce do preview
+        await pilot.pause()
+        cached = next(iter(app._preview_cache.values()), "")
+        assert "última resposta" in cached
+        assert "última pergunta" in cached
+        assert "**tamanho:**" in cached  # tamanho da sessão no cabeçalho
+        # pedido inicial continua lá — mas DEPOIS das últimas mensagens
+        assert cached.index("Últimas mensagens") < cached.index("Pedido inicial")
+        assert "pedido inicial antigo" in cached
 
 
 async def test_tui_nota_esc_fecha_modal(

@@ -99,12 +99,13 @@ sessionhub doctor                   # diagnóstico de harnesses/ferramentas/term
 | `q` | sair |
 | `?` | ajuda |
 
-O painel direito mostra o **pedido inicial** (primeira mensagem real do
-usuário, com invólucros de paste/reminder desembrulhados), as **últimas
-mensagens** da conversa (👤/🤖, com timestamps), estado do git
-(dirty/ahead/behind/PR), comando de retomada e a nota — rola com o mouse.
-A leitura do transcript roda fora do event loop (transcripts de GB não
-travam a TUI) com debounce e cache por (caminho, mtime).
+O painel direito abre nas **últimas mensagens** da conversa (👤/🤖, com
+timestamps) — o que rolou na última vez que você usou a sessão —, com o
+**tamanho do transcript** e o nº de mensagens no cabeçalho, estado do git
+(dirty/ahead/behind/PR), comando de retomada e a nota; o **pedido
+inicial** (primeira mensagem real, desembrulhada) fica no fim. Rola com o
+mouse. A leitura do transcript roda fora do event loop (transcripts de GB
+não travam a TUI) com debounce e cache por (caminho, mtime).
 
 Refresh: um **watcher** (watchdog) observa `~/.claude/projects` e dispara um
 scan quente quando transcripts mudam (~2s); sem watchdog instalado — ou fora
@@ -214,9 +215,11 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
   sessão viva aparecem na árvore mesmo sem sessão indexada.
 - **Branch vem do git, não do transcript**: `gitBranch:"HEAD"` é unreliable;
   o branch real vem do `git status` do worktree.
-- **Títulos**: primeira mensagem real do usuário, pulando comandos/meta/
+- **Títulos**: `/rename` vence (o `custom-title.json` gravado pelo Claude
+  Code); senão a primeira mensagem real do usuário, pulando comandos/meta/
   task-notifications, desembrulhando `<pasted_content>`/`<system-reminder>`;
-  fallback para o `summary` (escrito pelo Claude em compacts).
+  fallback para o `summary` (escrito pelo Claude em compacts). Um `/rename`
+  depois da indexação entra no índice sem re-parsear o transcript.
 - **PRs com cache**: `gh pr list` roda com TTL de 5min por repo (rede é
   lenta; `scan --full` zera o cache).
 - **Migrações**: o schema evolui via `PRAGMA user_version` — um `index.db`
@@ -226,7 +229,7 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
 
 ```powershell
 uv pip install -e ".[dev]" --python .venv\Scripts\python.exe
-python -m pytest      # 134 testes (fixtures sintéticas em tmp; nada real)
+python -m pytest      # 141 testes (fixtures sintéticas em tmp; nada real)
 python -m ruff check .
 python -m mypy
 ```

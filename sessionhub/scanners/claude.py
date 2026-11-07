@@ -7,7 +7,8 @@ desconhecida — ignoramos e deixamos o git resolver. O `sessionId` interno NÃO
 é usado como id: o id é o nome do arquivo (é ele que o `claude --resume`
 procura), porque o sessionId de linhas de subagente é o da sessão pai.
 
-O título é a primeira mensagem real do usuário (pulando isMeta, comandos
+O título: `custom-title.json` gravado pelo `/rename` do usuário vence;
+senão, a primeira mensagem real do usuário (pulando isMeta, comandos
 locais `<command-*>` e subagentes), com fallback para o campo `summary`.
 
 Performance: as linhas passam por um pre-filtro de substring antes do
@@ -135,6 +136,21 @@ class ClaudeScanner:
             problem=problem,
         )
 
+    def _custom_title(self, fp: Path) -> str | None:
+        """Título definido pelo usuário (/rename) — custom-title.json.
+
+        O Claude Code grava `{"customTitle": "..."}` numa pasta irmã do
+        transcript: `projects/<proj>/<session-id>/custom-title.json`.
+        """
+        try:
+            data = json.loads(
+                (fp.parent / fp.stem / "custom-title.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        title = data.get("customTitle") if isinstance(data, dict) else None
+        return title.strip() if isinstance(title, str) and title.strip() else None
+
     def discover(self, fingerprints: dict[str, tuple[float, int]] | None = None) -> DiscoverResult:
         result = DiscoverResult()
         if not self.projects_dir.is_dir():
@@ -150,6 +166,7 @@ class ClaudeScanner:
                 continue
             key = str(fp)
             result.seen.add(key)
+            custom_title = self._custom_title(fp)
             try:
                 stat = fp.stat()
             except OSError as exc:
@@ -160,6 +177,10 @@ class ClaudeScanner:
                 prev = fingerprints.get(key)
                 if prev is not None and prev == (stat.st_mtime, stat.st_size):
                     result.skipped += 1
+                    # /rename depois da última indexação: o transcript não
+                    # mudou, mas o título sim — vai sem re-parse.
+                    if custom_title:
+                        result.renames[key] = custom_title
                     continue
             try:
                 session = self.parse_file(fp, stat)
@@ -168,6 +189,8 @@ class ClaudeScanner:
                 result.errors += 1
                 continue
             if session is not None:
+                if custom_title:
+                    session.title = custom_title  # /rename vence a 1ª mensagem
                 result.sessions.append(session)
         self._dedup(result)
         return result

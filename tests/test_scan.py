@@ -112,6 +112,29 @@ def test_scan_extra_repos(fake_home: Path, git_repo: Path, db: Database, tmp_pat
     assert len(db.list_worktrees()) >= 1
 
 
+def test_scan_aplica_rename_depois_da_primeira_indexacao(
+    fake_home: Path, db: Database, tmp_path: Path
+) -> None:
+    """/rename chegou depois: título muda no índice sem re-parsear nada."""
+    projects = fake_home / ".claude" / "projects" / "G--repo"
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, str(tmp_path), "v1")])
+    run_scan(db, _config(db, tmp_path), user_home=fake_home)
+    assert db.find_sessions(SID)[0]["title"] == "v1"
+
+    # /rename chegou depois (pasta irmã do transcript)
+    title_dir = projects / SID
+    title_dir.mkdir(parents=True, exist_ok=True)
+    (title_dir / "custom-title.json").write_text(
+        '{"customTitle":"meu título"}', encoding="utf-8"
+    )
+    stats = run_scan(db, _config(db, tmp_path), user_home=fake_home)
+    assert stats.sessions == 0  # transcript intacto: nada re-parseado
+    assert stats.sessions_skipped == 1
+    row = db.find_sessions(SID)[0]
+    assert row["title"] == "meu título"
+    assert row["message_count"] == 1  # campos intactos
+
+
 def test_scan_purga_eventos_antigos(fake_home: Path, db: Database, tmp_path: Path) -> None:
     """O scan roda a retenção da tabela events (config.retention_days)."""
     projects = fake_home / ".claude" / "projects" / "G--repo"

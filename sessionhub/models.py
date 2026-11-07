@@ -94,13 +94,16 @@ class DiscoverResult:
     """Saída de um scanner: apenas sessões novas/alteradas.
 
     `seen` carrega os paths de transcripts encontrados (mesmo inalterados),
-    para o chamador saber o que ainda existe na origem.
+    para o chamador saber o que ainda existe na origem. `renames` carrega
+    títulos custom de arquivos INALTERADOS (ex.: /rename do Claude Code) —
+    o chamador aplica direto no índice, sem re-parsear o transcript.
     """
 
     sessions: list[Session] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
     skipped: int = 0
     errors: int = 0
+    renames: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

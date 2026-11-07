@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from .fmt import age
+from .fmt import age, human_size
 from .log import get_logger
 from .models import STATUS_ICONS
 from .scanners.claude import (
@@ -153,7 +153,12 @@ def _fmt_dt(iso: str | None) -> str:
 
 
 def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None) -> str:
-    """Painel de pré-visualização completo (markdown p/ o widget da TUI)."""
+    """Painel de pré-visualização completo (markdown p/ o widget da TUI).
+
+    Ordem pensada para "o que rolou por último": cabeçalho compacto →
+    últimas mensagens → pedido inicial no fim (rola pra baixo para ver
+    como a sessão começou).
+    """
     icon = STATUS_ICONS.get(row.get("status") or "", "❔")
     title = (row.get("title") or "*_(sem título)_*").replace("|", "\\|")
     out: list[str] = [f"# {icon} {title}", ""]
@@ -168,8 +173,16 @@ def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None
     out.append(f"- **worktree:** `{wt}`{mark}")
     out.append(
         f"- **atividade:** {age(row.get('last_activity'))} atrás"
-        f" · criada em {_fmt_dt(row.get('created_at'))} · {row.get('message_count', 0)} msgs"
+        f" · criada em {_fmt_dt(row.get('created_at'))}"
     )
+    size: int | None = None
+    tp = row.get("transcript_path")
+    if tp:
+        try:
+            size = os.path.getsize(str(tp))
+        except OSError:
+            size = None
+    out.append(f"- **tamanho:** {human_size(size)} · {row.get('message_count', 0)} msgs")
     if row.get("note"):
         out.append(f"- 📌 **nota:** {row['note']}")
     if row.get("tags"):
@@ -196,18 +209,10 @@ def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None
         out.append(str(row["resume_command"]))
         out.append("```")
 
+    # o que interessa primeiro: as últimas mensagens da conversa
     out.append("")
     messages = tail_messages(row.get("transcript_path"), str(row.get("harness")))
-    first = first_user_message(row.get("transcript_path"), str(row.get("harness")))
-    if first and not (messages and messages[0].text == first.text):
-        when = f" _({first.ts})_" if first.ts else ""
-        out.append("## 💬 Pedido inicial")
-        out.append("")
-        out.append(f"**👤 você**{when}")
-        for chunk in first.text.splitlines():
-            out.append(f"> {chunk}")
-        out.append("")
-    out.append("## Últimas mensagens")
+    out.append("## 💬 Últimas mensagens")
     if not messages:
         out.append("_transcript vazio, ilegível ou de harness ainda sem suporte._")
     for m in messages:
@@ -216,5 +221,18 @@ def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None
         out.append("")
         out.append(f"**{who}**{when}")
         for chunk in m.text.splitlines() or [""]:
+            out.append(f"> {chunk}")
+
+    # como a sessão começou — no fim, fora da primeira dobra
+    first = first_user_message(row.get("transcript_path"), str(row.get("harness")))
+    if first and not (messages and messages[0].text == first.text):
+        when = f" _({first.ts})_" if first.ts else ""
+        out.append("")
+        out.append("---")
+        out.append("")
+        out.append("## 🌱 Pedido inicial")
+        out.append("")
+        out.append(f"**👤 você**{when}")
+        for chunk in first.text.splitlines():
             out.append(f"> {chunk}")
     return "\n".join(out)

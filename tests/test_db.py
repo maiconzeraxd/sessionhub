@@ -227,6 +227,19 @@ def test_eventos(db: Database) -> None:
     assert events[0]["event"] == "Stop"  # mais recente primeiro
 
 
+def test_update_titles_renome_sem_reparse(db: Database) -> None:
+    """Título custom (/rename) aplicado por UPDATE pontual — resto intacto."""
+    db.upsert_sessions([_session(session_id="1", title="antigo", transcript_path="G:\\a.jsonl")])
+    assert db.update_titles("claude", {"G:\\a.jsonl": "novo nome"}) == 1
+    row = db.find_sessions("1")[0]
+    assert row["title"] == "novo nome"
+    assert row["message_count"] == 3  # nada foi zerado
+    # sem casamento (path/harness) ou dict vazio → 0, sem explodir
+    assert db.update_titles("claude", {"G:\\zz.jsonl": "x"}) == 0
+    assert db.update_titles("codex", {"G:\\a.jsonl": "x"}) == 0
+    assert db.update_titles("claude", {}) == 0
+
+
 def test_purge_events_por_idade(db: Database) -> None:
     db.record_event("2026-01-01T00:00:00+00:00", "claude", "velho", "Notification")
     db.record_event("2030-01-01T00:00:00+00:00", "claude", "futuro", "Stop")

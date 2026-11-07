@@ -107,6 +107,7 @@ def test_preview_markdown(fake_home: Path) -> None:
     assert "✎ 3" in md and "↑1" in md
     assert "👤 você" in md
     assert "**tamanho:**" in md  # tamanho do transcript no cabeçalho
+    assert "**último acesso:**" in md  # data absoluta + idade (não só "5min")
     # ordem: últimas mensagens primeiro, pedido inicial no fim
     assert md.index("Últimas mensagens") < md.index("Pedido inicial")
     assert "pergunta de teste" in md

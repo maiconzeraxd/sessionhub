@@ -20,7 +20,8 @@ Fases (a do momento marcada):
 2. ✅ TUI (árvore, filtros, busca, preview) + abrir sessão no terminal
 3. ⬜ Monitoramento ao vivo (hooks + psutil): 🟢 rodando / 🟡 esperando você
    (o watcher de transcripts — scan quente na TUI — já está ativo)
-4. ⬜ Backup incremental + restore + agendamento + age
+4. 🟡 Backup (primeiro corte pronto: `b` → pasta datada, um `.md` por
+   sessão) + restore + agendamento + age
 5. ⬜ Scanners Codex (`.jsonl.zst`), Gemini CLI, Aider + busca full-text FTS5
 6. ⬜ Daemon + notificações + doctor polish
 
@@ -99,9 +100,10 @@ sessionhub doctor                   # diagnóstico de harnesses/ferramentas/term
 | `/` | busca fuzzy — título, branch, session_id, nota… (aceita sem acento); `Enter` volta pra árvore, `Esc` limpa |
 | `Tab` | alternar foco árvore ↔ busca |
 | `n` | adicionar/editar nota 📌 e tags da sessão |
+| `m` | marcar/desmarcar sessão para o backup (✓ no rótulo) |
 | `c` | copiar o comando de retomada |
 | `o` | abrir o worktree no editor (`code .`) |
-| `b` | backup das sessões (fase 4 — hoje só avisa) |
+| `b` | backup das sessões marcadas — ou da selecionada — em pasta datada |
 | `x` | arquivar/ocultar sessão (reversível com `H`) |
 | `H` | mostrar/ocultar arquivadas |
 | `s` | re-escanear (dentro da TUI) |
@@ -110,12 +112,34 @@ sessionhub doctor                   # diagnóstico de harnesses/ferramentas/term
 | `?` | ajuda |
 
 O painel direito abre nas **últimas mensagens** da conversa (👤/🤖, com
-timestamps) — o que rolou na última vez que você usou a sessão —, com o
-**tamanho do transcript** e o nº de mensagens no cabeçalho, estado do git
-(dirty/ahead/behind/PR), comando de retomada e a nota; o **pedido
-inicial** (primeira mensagem real, desembrulhada) fica no fim. Rola com o
-mouse. A leitura do transcript roda fora do event loop (transcripts de GB
-não travam a TUI) com debounce e cache por (caminho, mtime).
+timestamps) — o que rolou na última vez que você usou a sessão —, com a
+**data do último acesso**, o **tamanho do transcript** e o nº de mensagens
+no cabeçalho (o tamanho também aparece no rótulo de cada sessão da
+árvore), estado do git (dirty/ahead/behind/PR), comando de retomada e a
+nota; o **pedido inicial** (primeira mensagem real, desembrulhada) fica no
+fim. Rola com o mouse. A leitura do transcript roda fora do event loop
+(transcripts de GB não travam a TUI) com debounce e cache por
+(caminho, mtime).
+
+### Backup ( `b` )
+
+Marque sessões com `m` (✓ no rótulo) e aperte `b` — sem marcas, vale a
+sessão selecionada. Um modal confirma a lista e o destino (campo editável,
+pré-preenchido com o `[backup] dir` do config). Confirmar cria
+
+```
+<destino>/2026-11-07_15-30/
+  Conserta o scanner__3aee5ee9.md
+  Migra o banco__9f39ecf6.md
+```
+
+— pasta com a data, **um `.md` por sessão** (título sanitizado + prefixo
+do id no nome). Cada `.md` traz um cabeçalho com os metadados (id, datas,
+branch, worktree, tamanho, nota, comando de retomada) e **a conversa
+completa** em Markdown, transcrita em streaming (transcripts de GB não
+estouram a memória). Transcript que sumiu vira erro visível, não backup
+silencioso. A escrita acontece **só no destino** — os transcripts dos
+harnesses são apenas lidos.
 
 Refresh: um **watcher** (watchdog) observa `~/.claude/projects` e dispara um
 scan quente quando transcripts mudam (~2s); sem watchdog instalado — ou fora
@@ -162,6 +186,7 @@ Criado com comentários no primeiro uso. Campos principais:
 | `open_command` | — | template com `{cwd}` e `{cmd}` (tem prioridade sobre tudo) |
 | `editor` | `code` | usado pela tecla `o` |
 | `extra_repos` | `[]` | repos sem sessão Claude (ex.: só Codex) |
+| `backup.dir` | `~/.sessionhub/backups` | destino dos backups da tecla `b` (editável no modal) |
 | `retention.days` | `30` | eventos (hooks, fase 3) mais velhos que isso saem a cada scan |
 
 App data vive só em `~/.sessionhub/` (`config.toml`, `index.db`, `logs/`).
@@ -178,6 +203,7 @@ sessionhub/
   db.py           SQLite (WAL): sessions, worktrees, events, meta (+migrações)
   gitinfo.py      worktree list/status/PRs (paralelo; PRs com cache de 5min)
   preview.py      tail do transcript → markdown
+  backup.py       sessões → .md em pasta datada (streaming, conversa completa)
   open.py         resolução+verificação de terminal, montagem do comando
   terminals.py    detecção do terminal atual (env) p/ abertura de sessão
   watcher.py      watchdog → scan quente na TUI quando transcripts mudam
@@ -240,7 +266,7 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
 ```bash
 uv pip install -e ".[dev]" --python .venv/Scripts/python.exe  # Windows
 uv pip install -e ".[dev]" --python .venv/bin/python          # Linux/macOS
-python -m pytest      # 148 testes (fixtures sintéticas em tmp; nada real)
+python -m pytest      # 159 testes (fixtures sintéticas em tmp; nada real)
 python -m ruff check .
 python -m mypy
 ```

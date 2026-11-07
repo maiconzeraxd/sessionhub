@@ -172,9 +172,10 @@ def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None
     mark = "" if exists else " ⚠ *(caminho não existe mais)*"
     out.append(f"- **worktree:** `{wt}`{mark}")
     out.append(
-        f"- **atividade:** {age(row.get('last_activity'))} atrás"
-        f" · criada em {_fmt_dt(row.get('created_at'))}"
+        f"- **último acesso:** {_fmt_dt(row.get('last_activity'))}"
+        f" · {age(row.get('last_activity'))} atrás"
     )
+    out.append(f"- **criada em:** {_fmt_dt(row.get('created_at'))}")
     size: int | None = None
     tp = row.get("transcript_path")
     if tp:

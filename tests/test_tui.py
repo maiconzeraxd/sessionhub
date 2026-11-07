@@ -11,10 +11,17 @@ import pytest
 from helpers import make_assistant_line, make_user_line, write_transcript
 from textual.widgets import Input, Tree
 
+from sessionhub.backup import BackupResult
 from sessionhub.config import Config
 from sessionhub.db import Database
 from sessionhub.models import Session
-from sessionhub.tui import NodeData, NoteScreen, SessionHubApp, SessionTree
+from sessionhub.tui import (
+    BackupScreen,
+    NodeData,
+    NoteScreen,
+    SessionHubApp,
+    SessionTree,
+)
 
 SID = "11111111-2222-3333-4444-555555555555"
 
@@ -56,8 +63,11 @@ def _fill_db(db: Database, tmp_path: Path) -> None:
     )
 
 
-def _app(config: Config) -> SessionHubApp:
-    return SessionHubApp(config=config)
+def _app(config: Config, tmp_path: Path) -> SessionHubApp:
+    """App isolado: user_home em tmp — watcher/scan nunca tocam o home real
+    (durante os testes, os transcripts REAIS estão mudando; um scan quente
+    no meio do teste reconstruía a árvore e quebrava o timing)."""
+    return SessionHubApp(config=config, user_home=tmp_path / "home")
 
 
 def test_fold_e_search_matches() -> None:
@@ -75,7 +85,7 @@ def test_fold_e_search_matches() -> None:
 
 async def test_tui_monta_arvore_com_sessoes(db: Database, tmp_path: Path, config: Config) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         tree = app.query_one("#tree", Tree)
@@ -95,7 +105,7 @@ async def test_tui_monta_arvore_com_sessoes(db: Database, tmp_path: Path, config
 
 async def test_tui_filtro_esperando(db: Database, tmp_path: Path, config: Config) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.action_filter_waiting()
@@ -115,7 +125,7 @@ async def test_tui_busca_fuzzy_filtra(
     db: Database, tmp_path: Path, config: Config
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         search = app.query_one("#search", Input)
@@ -139,7 +149,7 @@ async def test_tui_busca_ignora_acentos(
     """Digitar sem acento acha título com acento (pt-BR: 'aplicacao' → 'Aplicação')."""
     _fill_db(db, tmp_path)
     db.update_titles("claude", {str(tmp_path / "t.jsonl"): "Analisa a aplicação"})
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         search = app.query_one("#search", Input)
@@ -178,7 +188,7 @@ async def test_tui_busca_esconde_worktree_sem_correspondencia(
             ),
         ],
     )
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         tree = app.query_one("#tree", Tree)
@@ -204,7 +214,7 @@ async def test_tui_busca_sem_resultado_mostra_aviso(
     db: Database, tmp_path: Path, config: Config
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         search = app.query_one("#search", Input)
@@ -222,7 +232,7 @@ async def test_tui_busca_expande_worktree_colapsada(
     """Resultado dentro de worktree colapsada precisa aparecer (a busca
     não restaura o colapso)."""
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         tree = app.query_one("#tree", SessionTree)
@@ -243,7 +253,7 @@ async def test_tui_enter_na_busca_volta_foco_pro_tree(
     db: Database, tmp_path: Path, config: Config
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.action_focus_search()
@@ -258,7 +268,7 @@ async def test_tui_esc_limpa_busca(
     db: Database, tmp_path: Path, config: Config
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         search = app.query_one("#search", Input)
@@ -285,9 +295,101 @@ async def test_tui_esc_limpa_busca(
         assert len(titles) == 2
 
 
+async def test_tui_m_marca_e_desmarca_sessao(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    """m marca a sessão atual (✓ no label) para o backup; m de novo desfaz."""
+    _fill_db(db, tmp_path)
+    app = _app(config, tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current_row = db.find_sessions(SID)[0]
+
+        await pilot.press("m")
+        await pilot.pause()
+        assert app._picked == {("claude", SID)}
+        tree = app.query_one("#tree", Tree)
+        labels = [
+            str(child.label)
+            for node in tree.root.children
+            for wt in node.children
+            for child in wt.children
+            if child.data and getattr(child.data, "kind", "") == "session"
+        ]
+        assert any(lbl.startswith("✓") and "conserta scanner" in lbl for lbl in labels)
+
+        await pilot.press("m")
+        await pilot.pause()
+        assert app._picked == set()
+        labels = [
+            str(child.label)
+            for node in tree.root.children
+            for wt in node.children
+            for child in wt.children
+            if child.data and getattr(child.data, "kind", "") == "session"
+        ]
+        assert not any(lbl.startswith("✓") for lbl in labels)
+
+
+async def test_tui_backup_modal_confirma_e_grava(
+    db: Database, tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """b abre o modal (destino pré-preenchido do config); confirmar chama o
+    backup com as sessões marcadas e registra o evento."""
+    _fill_db(db, tmp_path)
+    calls: list[tuple[list[dict], Path]] = []
+
+    def fake_backup(rows, dest, now=None):  # type: ignore[no-untyped-def]
+        calls.append((list(rows), Path(dest)))
+        return BackupResult(
+            folder=Path(dest) / "2026-11-07_15-30",
+            done=list(rows),
+            files=[Path("x.md")],
+            errors=[],
+        )
+
+    monkeypatch.setattr("sessionhub.tui.backup_sessions", fake_backup)
+    app = _app(config, tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._picked = {("claude", SID), ("claude", "99999999-2222-3333-4444-555555555555")}
+        app.action_backup()
+        await pilot.pause()
+        assert isinstance(app.screen, BackupScreen)
+        modal = app.screen
+        # destino pré-preenchido com o [backup] dir do config
+        assert modal.query_one("#backup-dest", Input).value == str(config.backup_dir)
+
+        from textual.widgets import Button
+
+        modal.query_one("#backup-confirm", Button).press()
+        await asyncio.sleep(0.2)  # to_thread
+        await pilot.pause()
+        assert len(calls) == 1
+        rows, dest = calls[0]
+        assert {r["session_id"] for r in rows} == {SID, "99999999-2222-3333-4444-555555555555"}
+        assert dest == Path(str(config.backup_dir))
+        # evento Backup registrado para as duas
+        events = db.last_events("claude", SID)
+        assert [e["event"] for e in events] == ["Backup"]
+
+
+async def test_tui_backup_sem_sessao_nao_abre_modal(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    _fill_db(db, tmp_path)  # banco com sessões, mas nada marcado/selecionado
+    app = _app(config, tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current_row = None
+        app.action_backup()
+        await pilot.pause()
+        assert not isinstance(app.screen, BackupScreen)
+
+
 async def test_tui_tecla_x_arquiva(db: Database, tmp_path: Path, config: Config) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         row = db.find_sessions(SID)[0]
@@ -301,7 +403,7 @@ async def test_tui_tecla_x_arquiva(db: Database, tmp_path: Path, config: Config)
 
 async def test_tui_nota_salva_no_banco(db: Database, tmp_path: Path, config: Config) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current_row = db.find_sessions(SID)[0]
@@ -314,7 +416,7 @@ async def test_tui_nota_salva_no_banco(db: Database, tmp_path: Path, config: Con
 
 async def test_tui_tecla_4_filtra_todas(db: Database, tmp_path: Path, config: Config) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.press("4")
@@ -328,7 +430,7 @@ async def test_tui_atalhos_nao_quebram(
     db: Database, tmp_path: Path, config: Config, key: str
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         # foca a árvore p/ as teclas irem pro widget certo
@@ -362,7 +464,7 @@ async def test_tui_clique_unico_navega_duplo_abre(
         "sessionhub.tui.open_session",
         lambda row, cfg, **kw: opened.append(str(row["session_id"])) or ok,
     )
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         tree = app.query_one("#tree", SessionTree)
@@ -397,7 +499,7 @@ async def test_tui_clique_unico_mostra_ultimas_mensagens(
     lines.append(make_user_line(SID, str(tmp_path), "última pergunta", ts="2026-11-01T11:00:00Z"))
     lines.append(make_assistant_line(SID, str(tmp_path), "última resposta", "2026-11-01T11:00:30Z"))
     write_transcript(tmp_path / "t.jsonl", lines)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         tree = app.query_one("#tree", SessionTree)
@@ -427,7 +529,7 @@ async def test_tui_nota_esc_fecha_modal(
 ) -> None:
     """Esc fecha o modal de nota (bug 7 da revisão)."""
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current_row = db.find_sessions(SID)[0]
@@ -445,7 +547,7 @@ async def test_tui_nota_botao_salva(
     db: Database, tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current_row = db.find_sessions(SID)[0]
@@ -476,7 +578,7 @@ async def test_tui_preview_cacheado(
         return "md"
 
     monkeypatch.setattr("sessionhub.tui.preview_markdown", fake_preview)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         row = db.find_sessions(SID)[0]
@@ -500,7 +602,7 @@ async def test_tui_rebuild_preserva_colapso(
     db: Database, tmp_path: Path, config: Config
 ) -> None:
     _fill_db(db, tmp_path)
-    app = _app(config)
+    app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         tree = app.query_one("#tree", SessionTree)

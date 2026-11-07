@@ -19,6 +19,7 @@ import contextlib
 import os
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +30,10 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, Markdown, Select, Tree
 
+from .backup import BackupResult, backup_sessions
 from .config import Config, load_config
 from .db import Database
-from .fmt import age, git_badges, short_path
+from .fmt import age, git_badges, human_size, short_path
 from .log import get_logger
 from .models import STATUS_ICONS
 from .open import open_in_editor, open_session
@@ -148,10 +150,11 @@ class HelpScreen(ModalScreen[None]):
 [b]Sessões[/b]
   Enter         abrir no terminal (worktree + resume)
   n             editar nota/tags (só no app, nunca no transcript)
+  m             marcar/desmarcar sessão para o backup (✓)
+  b             backup: sessões marcadas → pasta datada, um .md por sessão
   c             copiar comando de retomada
   o             abrir worktree no editor ($EDITOR ou code)
   x             arquivar/ocultar da lista (x de novo desfaz)
-  b             backup agora (fase 4)
 
 [b]Índice[/b]
   s             escanear agora (scanners + git)
@@ -268,6 +271,77 @@ class MissingScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class BackupScreen(ModalScreen[dict[str, Any] | None]):
+    """Confirmar backup: sessões marcadas → pasta datada, um .md por sessão.
+
+    O destino é editável (pré-preenchido com o [backup] dir do config).
+    Enter ou o botão confirmam; Esc cancela. Retorna
+    {"rows": [...], "dest": caminho} ou None.
+    """
+
+    DEFAULT_CSS = """
+    BackupScreen { align: center middle; }
+    #backup-box { width: 72; height: auto; max-height: 80%;
+                  border: thick $accent; background: $surface; padding: 1 2; }
+    #backup-box Label { width: 1fr; }
+    #backup-names { height: auto; max-height: 12; overflow-y: auto;
+                    color: $text-muted; }
+    #backup-dest { width: 1fr; }
+    #backup-actions { height: 3; align-horizontal: right; }
+    #backup-box Button { margin: 0 1 0 0; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancelar")]
+
+    MAX_NAMES = 8
+
+    def __init__(self, rows: list[dict[str, Any]], dest: str) -> None:
+        super().__init__()
+        self.rows = rows
+        self._dest = dest
+
+    def compose(self) -> ComposeResult:
+        names = [str(r.get("title") or r.get("session_id")) for r in self.rows]
+        shown = "\n".join(f"✓ {n}" for n in names[: self.MAX_NAMES])
+        if len(names) > self.MAX_NAMES:
+            shown += f"\n… (+{len(names) - self.MAX_NAMES} sessões)"
+        with Vertical(id="backup-box"):
+            yield Label(f"Backup de {len(self.rows)} sessão(ões) — um .md por sessão")
+            yield Label(shown, id="backup-names")
+            yield Label("destino (uma pasta com a data será criada dentro dele):")
+            yield Input(self._dest, id="backup-dest")
+            with Horizontal(id="backup-actions"):
+                yield Button(
+                    f"Fazer backup ({len(self.rows)})",
+                    id="backup-confirm",
+                    variant="primary",
+                )
+                yield Button("Cancelar", id="backup-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#backup-dest", Input).focus()
+
+    @on(Input.Submitted, "#backup-dest")
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._confirm()
+
+    @on(Button.Pressed, "#backup-confirm")
+    def _confirm_pressed(self) -> None:
+        self._confirm()
+
+    @on(Button.Pressed, "#backup-cancel")
+    def _cancel_pressed(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _confirm(self) -> None:
+        dest = self.query_one("#backup-dest", Input).value.strip() or self._dest
+        self.dismiss({"rows": self.rows, "dest": dest})
+
+
 # ------------------------------------------------------------------ app
 
 
@@ -301,6 +375,7 @@ class SessionHubApp(App[None]):
         Binding("c", "copy_resume", "Copiar cmd"),
         Binding("o", "open_editor", "Editor"),
         Binding("n", "note", "Nota"),
+        Binding("m", "toggle_pick", "Marcar"),
         Binding("x", "hide", "Arquivar"),
         Binding("b", "backup", "Backup"),
         Binding("H", "toggle_hidden_view", "Ocultas"),
@@ -315,6 +390,7 @@ class SessionHubApp(App[None]):
         self.search = ""
         self.harness_filter: str | None = None
         self.show_hidden = False
+        self._picked: set[tuple[str, str]] = set()  # (harness, session_id) p/ backup
         self._current_row: dict[str, Any] | None = None
         self._worktrees: dict[str, dict[str, Any]] = {}
         self._last_db_key: tuple[Any, ...] | None = None
@@ -546,7 +622,11 @@ class SessionHubApp(App[None]):
             node = self._find_session_node(root, selected)
             if node is not None:
                 with contextlib.suppress(Exception):
-                    tree.select_node(node)
+                    # move_cursor SÓ destaca (NodeHighlighted → preview).
+                    # select_node postaria NodeSelected → abriria a sessão num
+                    # terminal novo a cada rebuild (bug: busca/filtro/nota
+                    # re-abriam a sessão selecionada).
+                    tree.move_cursor(node)
         self._update_summary()
 
     @staticmethod
@@ -612,13 +692,29 @@ class SessionHubApp(App[None]):
         icon = STATUS_ICONS.get(row.get("status") or "", "❔")
         if row.get("hidden"):
             icon = "📦"
+        mark = "✓ " if (row["harness"], row["session_id"]) in self._picked else ""
         title = row.get("title") or "(sem título)"
         if len(title) > 52:
             title = title[:49] + "…"
         note = " 📌" if row.get("note") else ""
         msgs = row.get("message_count") or 0
         age_txt = age(row.get("last_activity"))
-        return f"{icon} {title} · {row['harness']} · {age_txt} · {msgs}m{note}"
+        size = human_size(self._session_size(row))
+        return (
+            f"{mark}{icon} {title} · {row['harness']} · {age_txt}"
+            f" · {msgs}m{note} · {size}"
+        )
+
+    @staticmethod
+    def _session_size(row: dict[str, Any]) -> int | None:
+        """Tamanho do transcript (None se sumiu) — stat barato por rebuild."""
+        tp = row.get("transcript_path")
+        if not tp:
+            return None
+        try:
+            return os.path.getsize(str(tp))
+        except OSError:
+            return None
 
     def _update_summary(self) -> None:
         counts = self._db.status_counts()
@@ -744,11 +840,70 @@ class SessionHubApp(App[None]):
         state = "mostrando" if self.show_hidden else "ocultando"
         self.notify(f"arquivadas: {state}")
 
-    def action_help(self) -> None:
-        self.push_screen(HelpScreen())
+    def action_toggle_pick(self) -> None:
+        """Marca/desmarca a sessão atual para o backup (m)."""
+        row = self._current_row
+        if not row:
+            self.notify("selecione uma sessão primeiro", severity="warning")
+            return
+        key = (row["harness"], row["session_id"])
+        if key in self._picked:
+            self._picked.discard(key)
+            self.notify("desmarcada")
+        else:
+            self._picked.add(key)
+            self.notify("marcada para o backup (b confirma)")
+        self._rebuild()
 
     def action_backup(self) -> None:
-        self.notify("backup das sessões chega na fase 4", severity="warning")
+        """Backup das sessões marcadas (m) — ou da selecionada, se nenhuma."""
+        rows = [
+            r
+            for r in self._db.list_sessions(include_hidden=True, limit=None)
+            if (r["harness"], r["session_id"]) in self._picked
+        ]
+        if not rows and self._current_row:
+            rows = [self._current_row]
+        if not rows:
+            self.notify(
+                "marque sessões com m (ou navegue até uma) antes do backup",
+                severity="warning",
+            )
+            return
+        self.push_screen(
+            BackupScreen(rows, str(self.config.backup_dir)), self._on_backup_result
+        )
+
+    def _on_backup_result(self, result: dict[str, Any] | None) -> None:
+        if not result:
+            return  # cancelado
+        rows = [r for r in result.get("rows") or [] if isinstance(r, dict)]
+        dest = str(result.get("dest") or "")
+        if rows and dest:
+            asyncio.create_task(self._backup_task(rows, dest))
+
+    async def _backup_task(self, rows: list[dict[str, Any]], dest: str) -> None:
+        """Grava os .md fora do event loop; eventos + notificação no fim."""
+        self.notify(f"backup de {len(rows)} sessão(ões)…")
+        try:
+            result = await asyncio.to_thread(backup_sessions, rows, Path(dest))
+        except Exception as exc:  # noqa: BLE001 - backup não derruba a TUI
+            log.exception("backup falhou")
+            self.notify(f"backup falhou: {exc}", severity="error")
+            return
+        assert isinstance(result, BackupResult)
+        ts = datetime.now(UTC).isoformat()
+        for row in result.done:
+            with contextlib.suppress(Exception):
+                self._db.record_event(ts, row["harness"], row["session_id"], "Backup")
+        msg = f"backup ✓ {len(result.files)} .md → {result.folder}"
+        if result.errors:
+            msg += f" · {len(result.errors)} falha(s)"
+            self.notify("\n".join(result.errors[:3]), severity="warning")
+        self.notify(msg)
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     def action_scan(self) -> None:
         asyncio.create_task(self._scan_task())

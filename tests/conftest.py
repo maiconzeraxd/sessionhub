@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from helpers import git
 
 from sessionhub.config import Config
 from sessionhub.db import Database
+
+
+@pytest.fixture(autouse=True)
+def _never_open_real_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rede de segurança: teste nenhum abre terminal/editor de verdade.
+
+    Bug real de 2026-11-07: Tree.select_node posta NodeSelected e o rebuild
+    restaurava a "seleção" — a TUI abria `wt.exe -d <tmp> cmd /k claude
+    --resume <id-sintético>` em pleno pytest. Mesco com o bug corrigido,
+    nenhum teste pode spawnar processo real.
+    """
+    stub = SimpleNamespace(status="stub", command="", message="desabilitado em teste")
+    monkeypatch.setattr("sessionhub.tui.open_session", lambda *a, **k: stub)
+    monkeypatch.setattr("sessionhub.tui.open_in_editor", lambda *a, **k: stub)
 
 
 @pytest.fixture

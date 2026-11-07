@@ -8,7 +8,8 @@ abas/teclas 1-4, busca fuzzy ( / ), filtro por harness.
 Atalhos: Enter abre a sessão no terminal; n nota; c copia comando de
 retomada; o abre o worktree no editor; x arquiva/oculta; s escaneia;
 ? ajuda. Mouse: clique único navega (painel de preview), duplo-clique
-abre. Sem daemon, refresh automático a cada 5s.
+abre. Refresh: watcher opcional (watchdog) dispara scan quente quando
+transcripts mudam; sem ele, assinatura do índice a cada 5s.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import asyncio
 import contextlib
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +30,13 @@ from textual.widgets import Button, Footer, Header, Input, Label, Markdown, Sele
 
 from .config import Config, load_config
 from .db import Database
+from .fmt import age, git_badges, short_path
 from .log import get_logger
 from .models import STATUS_ICONS
 from .open import open_in_editor, open_session
 from .preview import preview_markdown
 from .scan import run_scan
+from .watcher import TranscriptWatcher
 
 log = get_logger(__name__)
 
@@ -44,6 +46,10 @@ FILTERS = {
     "forgotten": ("Esquecidas", ("forgotten",)),
     "all": ("Todas", None),
 }
+
+_PREVIEW_DEBOUNCE = 0.15  # s — navegação rápida não relê transcript a cada seta
+_SEARCH_DEBOUNCE = 0.2  # s — digitar não reconstroi a árvore por tecla
+_PREVIEW_CACHE_MAX = 64
 
 
 @dataclass
@@ -86,43 +92,6 @@ def _fuzzy(query: str, text: str) -> bool:
         return True
     iterator = iter(text.lower())
     return all(ch in iterator for ch in q)
-
-
-def _age(iso: str | None) -> str:
-    if not iso:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(iso)
-    except ValueError:
-        return "?"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    secs = max(0, int((datetime.now(UTC) - dt).total_seconds()))
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}min"
-    if secs < 86400:
-        return f"{secs // 3600}h"
-    if secs < 7 * 86400:
-        return f"{secs // 86400}d"
-    return f"{secs // (7 * 86400)}sem"
-
-
-def _git_badges(wt: dict[str, Any] | None) -> str:
-    if not wt:
-        return ""
-    parts: list[str] = []
-    dirty = (wt.get("staged") or 0) + (wt.get("unstaged") or 0) + (wt.get("untracked") or 0)
-    if dirty:
-        parts.append(f"✎{dirty}")
-    if wt.get("ahead"):
-        parts.append(f"↑{wt['ahead']}")
-    if wt.get("behind"):
-        parts.append(f"↓{wt['behind']}")
-    if wt.get("pr_number"):
-        parts.append(f"PR#{wt['pr_number']}")
-    return " ".join(parts)
 
 
 # ------------------------------------------------------------------ modais
@@ -188,7 +157,10 @@ class NoteScreen(ModalScreen[tuple[str, str] | None]):
     NoteScreen { align: center middle; }
     #note-box { width: 64; border: thick $accent; background: $surface; padding: 1 2; }
     #note-box Input { width: 1fr; }
+    #note-actions { height: 3; align-horizontal: right; }
     """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancelar")]
 
     def __init__(self, note: str, tags: str) -> None:
         super().__init__()
@@ -200,6 +172,9 @@ class NoteScreen(ModalScreen[tuple[str, str] | None]):
             yield Label("Nota da sessão (Enter salva · Esc cancela)")
             yield Input(self._note, id="note-input", placeholder="nota livre…")
             yield Input(self._tags, id="tags-input", placeholder="tags separadas por vírgula")
+            with Horizontal(id="note-actions"):
+                yield Button("Salvar", id="note-save", variant="primary")
+                yield Button("Cancelar", id="note-cancel")
 
     def on_mount(self) -> None:
         self.query_one("#note-input", Input).focus()
@@ -214,6 +189,10 @@ class NoteScreen(ModalScreen[tuple[str, str] | None]):
     @on(Button.Pressed, "#note-save")
     def _save_pressed(self) -> None:
         self._save()
+
+    @on(Button.Pressed, "#note-cancel")
+    def _cancel_pressed(self) -> None:
+        self.dismiss(None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -312,6 +291,12 @@ class SessionHubApp(App[None]):
         self._current_row: dict[str, Any] | None = None
         self._worktrees: dict[str, dict[str, Any]] = {}
         self._last_db_key: tuple[Any, ...] | None = None
+        # assíncrono: preview (debounce+cache), busca, watcher, abrir sessão
+        self._preview_task: asyncio.Task[None] | None = None
+        self._preview_cache: dict[tuple[str, float], str] = {}
+        self._search_task: asyncio.Task[None] | None = None
+        self._watch_task: asyncio.Task[None] | None = None
+        self._watcher: TranscriptWatcher | None = None
 
     # ------------------------------------------------------------ compose
 
@@ -335,9 +320,43 @@ class SessionHubApp(App[None]):
         self._refresh_harness_options()
         self._rebuild()
         self.set_interval(5.0, self._periodic_refresh)
+        self._start_watcher()
 
     def on_unmount(self) -> None:
+        if self._watcher is not None:
+            self._watcher.stop()
         self._db.close()
+
+    # ------------------------------------------------------------ watcher
+
+    def _start_watcher(self) -> None:
+        """Observa os diretórios de transcripts → scan quente em background.
+
+        Sem watchdog instalado é um no-op (o refresh de 5s cobre). Fase 5:
+        outros harnesses registram seus roots aqui.
+        """
+        home = self.user_home or Path.home()
+        roots = [home / ".claude" / "projects"]
+        watcher = TranscriptWatcher(self._on_transcripts_changed)
+        if watcher.start(roots):
+            self._watcher = watcher
+
+    def _on_transcripts_changed(self) -> None:
+        """Thread do observer → volta para o event loop da TUI."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.call_soon_threadsafe(self._schedule_watch_scan)
+
+    def _schedule_watch_scan(self) -> None:
+        if self._watch_task is not None and not self._watch_task.done():
+            return  # já agendado (rajada de eventos)
+        self._watch_task = asyncio.create_task(self._watch_scan_task())
+
+    async def _watch_scan_task(self) -> None:
+        await asyncio.sleep(2.0)  # agrupa rajadas de escrita do transcript
+        await self._scan_task(quiet=True)
 
     # ------------------------------------------------------------ dados
 
@@ -395,6 +414,8 @@ class SessionHubApp(App[None]):
         if self._current_row:
             selected = (self._current_row["harness"], self._current_row["session_id"])
 
+        # preserva o estado visual: worktrees colapsadas + rolagem
+        collapsed, scroll_y = self._tree_state(tree)
         tree.clear()
         root = tree.root
 
@@ -426,14 +447,17 @@ class SessionHubApp(App[None]):
         for wt in self._worktrees.values():
             repo = wt.get("repo_root") or "(sem repositório)"
             repo_wt_keys.setdefault(repo, set()).add(wt["path"])
-            # worktrees sem sessão: usam scanned_at como atividade
-            ts = wt.get("scanned_at") or ""
+            # worktrees sem sessão: usam o commit mais recente como atividade
+            ts = wt.get("head_ts") or wt.get("scanned_at") or ""
             if ts > repo_latest.get(repo, ""):
                 repo_latest[repo] = ts
 
         def _wt_sort(key: str) -> str:
-            rows = by_key.get(key, [])
-            return max((r.get("last_activity") or "" for r in rows), default="")
+            wt_rows = by_key.get(key, [])
+            wt = self._worktrees.get(key)
+            candidates = [r.get("last_activity") or "" for r in wt_rows]
+            candidates.append(str(wt.get("head_ts") or "") if wt else "")
+            return max(candidates, default="")
 
         ordered = sorted(repo_wt_keys, key=lambda r: repo_latest.get(r, ""), reverse=True)
         for repo in ordered:
@@ -456,12 +480,39 @@ class SessionHubApp(App[None]):
                     )
         root.expand()
 
+        if collapsed:
+            for node in self._walk_nodes(root):
+                if str(node.label) in collapsed:
+                    with contextlib.suppress(Exception):
+                        node.collapse()
+        if scroll_y > 0:
+            with contextlib.suppress(Exception):
+                tree.scroll_to(y=scroll_y, animate=False)
+
         if selected:
             node = self._find_session_node(root, selected)
             if node is not None:
                 with contextlib.suppress(Exception):
                     tree.select_node(node)
         self._update_summary()
+
+    @staticmethod
+    def _walk_nodes(node: Any) -> Any:
+        for child in getattr(node, "children", []):
+            yield child
+            yield from SessionHubApp._walk_nodes(child)
+
+    def _tree_state(self, tree: Tree) -> tuple[set[str], float]:
+        """(rótulos colapsados, scroll_y) antes de um rebuild."""
+        collapsed: set[str] = set()
+        try:
+            for node in self._walk_nodes(tree.root):
+                if not node.is_expanded:
+                    collapsed.add(str(node.label))
+            scroll_y = float(tree.scroll_offset.y)
+        except Exception:
+            return set(), 0.0
+        return collapsed, scroll_y
 
     def _find_session_node(self, node: Any, key: tuple[str, str]) -> Any:
         data = getattr(node, "data", None)
@@ -482,8 +533,7 @@ class SessionHubApp(App[None]):
         if repo == "(sem repositório)":
             return f"📂 (sem repositório) · {len(wt_keys)} pastas"
         name = os.path.basename(repo) or repo
-        drive = os.path.splitdrive(repo)[0]
-        return f"📁 {name} ({drive}\\…) · {len(wt_keys)} worktrees"
+        return f"📁 {name} ({short_path(repo)}) · {len(wt_keys)} worktrees"
 
     def _worktree_label(self, wt_key: str, rows: list[dict[str, Any]]) -> str:
         if wt_key.startswith("cwd::"):
@@ -492,14 +542,17 @@ class SessionHubApp(App[None]):
             return f"📂 {base} (fora de worktree)"
         wt = self._worktrees.get(wt_key)
         branch = (wt or {}).get("branch") or (rows[0].get("branch") if rows else None)
-        badges = _git_badges(wt)
+        badges = git_badges(wt)
         if not os.path.isdir(wt_key):
             return f"⚠ {os.path.basename(wt_key)} · {branch or '—'} · caminho não existe mais"
-        parts = [f"🌿 {branch or '—'}"]
+        icon = "🔴" if (wt or {}).get("forgotten") else "🌿"
+        parts = [f"{icon} {branch or '—'}"]
         if badges:
             parts.append(badges)
         if not rows:
-            parts.append("· sem sessões")
+            age_txt = age((wt or {}).get("head_ts"))
+            hint = "esquecida" if (wt or {}).get("forgotten") else "sem sessões"
+            parts.append(f"· {hint} · {age_txt}")
         return " ".join(parts) if parts else "🌿"
 
     def _session_label(self, row: dict[str, Any]) -> str:
@@ -511,21 +564,16 @@ class SessionHubApp(App[None]):
             title = title[:49] + "…"
         note = " 📌" if row.get("note") else ""
         msgs = row.get("message_count") or 0
-        age = _age(row.get("last_activity"))
-        return f"{icon} {title} · {row['harness']} · {age} · {msgs}m{note}"
+        age_txt = age(row.get("last_activity"))
+        return f"{icon} {title} · {row['harness']} · {age_txt} · {msgs}m{note}"
 
     def _update_summary(self) -> None:
         counts = self._db.status_counts()
         total = sum(counts.values())
         running = counts.get("running", 0)
         waiting = counts.get("waiting", 0)
-        forgotten = len(
-            {
-                r["worktree_path"]
-                for r in self._db.list_sessions(status="forgotten", include_hidden=True, limit=None)
-                if r.get("worktree_path")
-            }
-        )
+        # consulta agregada (sem listar todas as sessões esquecidas)
+        forgotten = self._db.forgotten_worktrees()
         label = (
             f"🟢 {running} rodando · 🟡 {waiting} esperando você · "
             f"🔴 {forgotten} worktrees esquecidas · {total} sessões"
@@ -555,6 +603,15 @@ class SessionHubApp(App[None]):
     @on(Input.Changed, "#search")
     def _search_changed(self, event: Input.Changed) -> None:
         self.search = event.value
+        if self._search_task is not None:
+            self._search_task.cancel()
+        self._search_task = asyncio.create_task(self._search_debounced())
+
+    async def _search_debounced(self) -> None:
+        try:
+            await asyncio.sleep(_SEARCH_DEBOUNCE)
+        except asyncio.CancelledError:
+            return  # tecla nova chegou
         self._rebuild()
 
     @on(Select.Changed, "#harness-select")
@@ -622,8 +679,9 @@ class SessionHubApp(App[None]):
     def action_scan(self) -> None:
         asyncio.create_task(self._scan_task())
 
-    async def _scan_task(self) -> None:
-        self.notify("scan em andamento…")
+    async def _scan_task(self, quiet: bool = False) -> None:
+        if not quiet:
+            self.notify("scan em andamento…")
 
         def _do_scan() -> tuple[int, int, float]:
             db = Database(self.config.db_path)
@@ -640,7 +698,8 @@ class SessionHubApp(App[None]):
             self.notify(f"scan falhou: {exc}", severity="error")
             return
         self._rebuild()
-        self.notify(f"scan ✓ {news} novas · {skipped} inalteradas · {duration:.1f}s")
+        if not quiet:
+            self.notify(f"scan ✓ {news} novas · {skipped} inalteradas · {duration:.1f}s")
 
     def action_copy_resume(self) -> None:
         row = self._current_row
@@ -716,11 +775,20 @@ class SessionHubApp(App[None]):
                     severity="warning",
                 )
             return
-        result = open_session(row, self.config)
+        # fora do event loop: launchers "cli" podem levar até 15s (timeout)
+        asyncio.create_task(self._open_row_async(row))
+
+    async def _open_row_async(self, row: dict[str, Any]) -> None:
+        try:
+            result = await asyncio.to_thread(open_session, row, self.config)
+        except Exception as exc:  # noqa: BLE001 - abrir nunca derruba a TUI
+            log.exception("abrir sessão falhou")
+            self.notify(f"falha ao abrir: {exc}", severity="error")
+            return
         if result.status == "error":
             self.notify(result.message, severity="error")
             return
-        title = row.get("title") or row["session_id"][:8]
+        title = row.get("title") or str(row["session_id"])[:8]
         self.notify(f"🚀 abriu: {title}")
 
     def _on_missing_result(self, result: str | None) -> None:
@@ -743,9 +811,34 @@ class SessionHubApp(App[None]):
     # ------------------------------------------------------------ preview
 
     def _update_preview(self, row: dict[str, Any]) -> None:
-        worktree = self._worktrees.get(row.get("worktree_path") or "")
-        md = preview_markdown(row, worktree)
-        self.query_one("#preview", Markdown).update(md)
+        """Preview com debounce: leitura do transcript roda fora do event
+        loop (transcripts de GB não travam a TUI) e é cacheada por
+        (caminho, mtime) — voltar para a mesma sessão não relê nada."""
+        if self._preview_task is not None:
+            self._preview_task.cancel()
+        self._preview_task = asyncio.create_task(self._preview_task_run(row))
+
+    async def _preview_task_run(self, row: dict[str, Any]) -> None:
+        try:
+            await asyncio.sleep(_PREVIEW_DEBOUNCE)
+            tp = str(row.get("transcript_path") or "")
+            try:
+                mtime = os.path.getmtime(tp) if tp else 0.0
+            except OSError:
+                mtime = 0.0
+            key = (tp, mtime)
+            md = self._preview_cache.get(key)
+            if md is None:
+                worktree = self._worktrees.get(row.get("worktree_path") or "")
+                md = await asyncio.to_thread(preview_markdown, row, worktree)
+                if len(self._preview_cache) >= _PREVIEW_CACHE_MAX:
+                    self._preview_cache.clear()
+                self._preview_cache[key] = md
+            self.query_one("#preview", Markdown).update(md)
+        except asyncio.CancelledError:
+            return  # substituído por um preview mais novo
+        except Exception:  # noqa: BLE001 - preview falha não derruba a TUI
+            log.exception("preview falhou")
 
     def _preview_worktree_hint(self) -> None:
         self.query_one("#preview", Markdown).update(

@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import os
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from helpers import git
 
+import sessionhub.gitinfo as gitinfo
 from sessionhub.gitinfo import (
+    clear_pr_cache,
     collect_worktrees,
     parse_branch_header,
+    parse_head_ts,
     parse_status,
     toplevel,
     worktree_list,
@@ -110,3 +116,67 @@ def test_parse_status() -> None:
     assert info["unstaged"] == 1
     assert info["staged"] == 2  # M + R
     assert info["untracked"] == 1
+
+
+def test_parse_head_ts() -> None:
+    # offset -03:00 → 13:00 UTC
+    assert parse_head_ts("2026-11-01T10:00:00-03:00") == datetime(
+        2026, 11, 1, 13, 0, tzinfo=UTC
+    )
+    assert parse_head_ts("2026-11-01T10:00:00+00:00") == datetime(
+        2026, 11, 1, 10, 0, tzinfo=UTC
+    )
+    assert parse_head_ts("lixo") is None
+    assert parse_head_ts("") is None
+
+
+def test_collect_worktrees_preenche_head_ts(git_repo: Path) -> None:
+    wts = collect_worktrees(_norm(git_repo), with_prs=False)
+    assert wts, "repo de fixture deveria ter o worktree main"
+    for w in wts:
+        assert w.head_ts is not None
+        assert w.head_ts.tzinfo is not None  # normalizado p/ UTC
+    # worktree sem commits (repo recém-iniciado não é o caso: fixture commita)
+    assert wts[0].head_ts is not None and wts[0].head_ts.year >= 2026
+
+
+# ------------------------------------------------------------- cache de PRs
+
+
+def test_pr_cache_evita_refetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Duas chamadas seguidas → uma só ida ao gh (a 2ª vem do cache)."""
+    calls: list[str] = []
+
+    def fake_fetch(repo_root: str) -> dict[str, tuple[int, str]]:
+        calls.append(repo_root)
+        return {"main": (7, "https://x/pr/7")}
+
+    monkeypatch.setattr(gitinfo, "_fetch_open_prs", fake_fetch)
+    clear_pr_cache()
+    first = gitinfo.repo_open_prs("C:/repo-a")
+    second = gitinfo.repo_open_prs("C:/repo-a")
+    assert first == second == {"main": (7, "https://x/pr/7")}
+    assert calls == ["C:/repo-a"]
+    # repos diferentes não compartilham entrada
+    gitinfo.repo_open_prs("C:/repo-b")
+    assert calls == ["C:/repo-a", "C:/repo-b"]
+
+
+def test_pr_cache_expira_e_limpa(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_fetch(repo_root: str) -> dict[str, tuple[int, str]]:
+        calls.append(repo_root)
+        return {}
+
+    monkeypatch.setattr(gitinfo, "_fetch_open_prs", fake_fetch)
+    clear_pr_cache()
+    # entrada com timestamp velho (TTL de 5min vencido) → refaz
+    with gitinfo._PR_LOCK:
+        gitinfo._PR_CACHE["/r"] = (time.monotonic() - 600.0, {})
+    gitinfo.repo_open_prs("/r")
+    assert calls == ["/r"]
+    # clear_pr_cache zera → próxima chamada refaz
+    clear_pr_cache()
+    gitinfo.repo_open_prs("/r")
+    assert calls == ["/r", "/r"]

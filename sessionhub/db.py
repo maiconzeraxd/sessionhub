@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,11 @@ from .log import get_logger
 from .models import Session, Worktree
 
 log = get_logger(__name__)
+
+
+def _norm_path(path: str) -> str:
+    """Caminho comparável (case/sep normalizados — FS case-insensitive)."""
+    return os.path.normcase(os.path.normpath(path))
 
 _SELECT_SESSIONS = """
 SELECT s.harness, s.session_id, s.title, s.cwd, s.repo_root, s.worktree_path,
@@ -64,6 +70,7 @@ CREATE TABLE IF NOT EXISTS worktrees (
     repo_root   TEXT NOT NULL,
     branch      TEXT,
     head        TEXT,
+    head_ts     TEXT,
     staged      INTEGER NOT NULL DEFAULT 0,
     unstaged    INTEGER NOT NULL DEFAULT 0,
     untracked   INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +78,7 @@ CREATE TABLE IF NOT EXISTS worktrees (
     behind      INTEGER,
     pr_number   INTEGER,
     pr_url      TEXT,
+    forgotten   INTEGER NOT NULL DEFAULT 0,
     scanned_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_worktrees_repo ON worktrees(repo_root);
@@ -98,6 +106,10 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.astimezone(UTC).isoformat()
 
 
+# Versão do esquema — incrementar a cada migração (ver Database._migrate).
+DB_VERSION = 2
+
+
 class Database:
     """Acesso ao índice. Uma instância = uma conexão (single-thread)."""
 
@@ -109,10 +121,37 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _migrate(self) -> None:
+        """Migrações incrementais via PRAGMA user_version.
+
+        Cada entrada = uma versão. Bancos novos já nascem com o esquema
+        atual (SCHEMA reflete a última versão); as ALTERs só aplicam em
+        bancos antigos, e cada uma checa se a coluna já existe.
+        """
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if version >= DB_VERSION:
+            return
+        if version < 2:
+            # v2 (revisão 2026-11-06, bug 3): head_ts = idade do último
+            # commit do worktree; forgotten = worktree sem sessão recente
+            # com trabalho não entregue (dirty OU ahead).
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(worktrees)")}
+            with self.conn:
+                if "head_ts" not in cols:
+                    self.conn.execute("ALTER TABLE worktrees ADD COLUMN head_ts TEXT")
+                if "forgotten" not in cols:
+                    self.conn.execute(
+                        "ALTER TABLE worktrees ADD COLUMN forgotten INTEGER NOT NULL DEFAULT 0"
+                    )
+        with self.conn:
+            self.conn.execute(f"PRAGMA user_version = {DB_VERSION}")
+        log.info("banco migrado para a versão %d (estava %d)", DB_VERSION, version)
 
     # ---------------------------------------------------------- sessões
 
@@ -218,6 +257,21 @@ class Database:
         ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def forgotten_worktrees(self) -> int:
+        """Nº de worktrees esquecidas (distinct): com sessão forgotten OU a
+        própria worktree marcada — uma contagem agregada, sem listar tudo."""
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT path FROM worktrees WHERE forgotten = 1
+                UNION
+                SELECT worktree_path FROM sessions
+                WHERE status = 'forgotten' AND worktree_path IS NOT NULL
+            )
+            """
+        ).fetchone()
+        return int(row[0])
+
     def distinct_harnesses(self) -> list[str]:
         rows = self.conn.execute(
             "SELECT DISTINCT harness FROM sessions ORDER BY harness"
@@ -238,8 +292,51 @@ class Database:
                 (1 if hidden else 0, harness, session_id),
             )
 
+    def mark_missing(self, harness: str, seen: Iterable[str]) -> int:
+        """Sessões cujo transcript não está mais no disco → status 'missing'.
+
+        Contrapartida: quem estava 'missing' e o arquivo voltou (p.ex.
+        restaurado com o mesmo mtime/size, quando o fingerprint pula o
+        re-parse) volta a 'stopped' — o recompute_status refina depois.
+        Retorna o nº de sessões marcadas como missing.
+        """
+        seen_norm = {_norm_path(p) for p in seen if p}
+        rows = self.conn.execute(
+            "SELECT session_id, transcript_path, status FROM sessions WHERE harness = ?",
+            (harness,),
+        ).fetchall()
+        gone: list[tuple[str, str]] = []
+        back: list[tuple[str, str]] = []
+        for sid, tp, status in rows:
+            if tp and _norm_path(tp) in seen_norm:
+                if status == "missing":
+                    back.append((harness, sid))
+            elif status != "missing":
+                gone.append((harness, sid))
+        with self.conn:
+            if gone:
+                self.conn.executemany(
+                    "UPDATE sessions SET status='missing' WHERE harness=? AND session_id=?",
+                    gone,
+                )
+            if back:
+                self.conn.executemany(
+                    "UPDATE sessions SET status='stopped' WHERE harness=? AND session_id=?",
+                    back,
+                )
+        return len(gone)
+
     def recompute_status(self, forgotten_hours: float) -> None:
-        """Status derivado (fase 3 refina com hooks/processos)."""
+        """Status derivado (fase 3 refina com hooks/processos).
+
+        Sessão: worktree com trabalho não entregue (dirty OU ahead — commits
+        não enviados contam) + sem atividade além de `forgotten_hours` →
+        'forgotten'.
+
+        Worktree SEM sessão recente na mesma situação ganha a flag
+        `forgotten` (🔴 no rótulo da worktree, não só das sessões): é o caso
+        do worktree esquecido que nunca teve sessão indexada.
+        """
         cutoff = (datetime.now(UTC) - timedelta(hours=forgotten_hours)).isoformat()
         with self.conn:
             self.conn.execute(
@@ -249,7 +346,8 @@ class Database:
                     WHEN EXISTS (
                         SELECT 1 FROM worktrees w
                         WHERE w.path = sessions.worktree_path
-                          AND (w.staged + w.unstaged + w.untracked) > 0
+                          AND (w.staged + w.unstaged + w.untracked
+                               + COALESCE(w.ahead, 0)) > 0
                     )
                      AND (last_activity IS NULL OR last_activity < ?)
                     THEN 'forgotten'
@@ -258,6 +356,20 @@ class Database:
                 WHERE status IN ('unknown', 'stopped', 'forgotten')
                 """,
                 (cutoff,),
+            )
+            self.conn.execute(
+                """
+                UPDATE worktrees SET forgotten = (
+                    (staged + unstaged + untracked + COALESCE(ahead, 0)) > 0
+                    AND head_ts IS NOT NULL AND head_ts < ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM sessions s
+                        WHERE s.worktree_path = worktrees.path
+                          AND s.last_activity IS NOT NULL AND s.last_activity >= ?
+                    )
+                )
+                """,
+                (cutoff, cutoff),
             )
 
     def known_repos(self) -> list[str]:
@@ -278,9 +390,10 @@ class Database:
             self.conn.execute("DELETE FROM worktrees WHERE repo_root = ?", (repo_root,))
             self.conn.executemany(
                 """
-                INSERT OR REPLACE INTO worktrees (path, repo_root, branch, head, staged,
-                    unstaged, untracked, ahead, behind, pr_number, pr_url, scanned_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT OR REPLACE INTO worktrees (path, repo_root, branch, head, head_ts,
+                    staged, unstaged, untracked, ahead, behind, pr_number, pr_url,
+                    forgotten, scanned_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -288,6 +401,7 @@ class Database:
                         w.repo_root,
                         w.branch,
                         w.head,
+                        _iso(w.head_ts),
                         w.staged,
                         w.unstaged,
                         w.untracked,
@@ -295,6 +409,7 @@ class Database:
                         w.behind,
                         w.pr_number,
                         w.pr_url,
+                        1 if w.forgotten else 0,
                         now,
                     )
                     for w in worktrees
@@ -342,6 +457,21 @@ class Database:
             (harness, session_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def purge_events(self, keep_days: int) -> int:
+        """Apaga eventos mais antigos que keep_days dias (0 = tudo até agora).
+
+        A tabela events (hooks da fase 3) cresce sem limite sem isso. Os ts
+        são ISO UTC, então a comparação lexicográfica no SQLite funciona.
+        Roda no fim de cada scan; retorna quantas linhas saíram.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=keep_days)).isoformat()
+        with self.conn:
+            cur = self.conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount or 0
+        if deleted:
+            log.info("purge_events: %d eventos com mais de %dd", deleted, keep_days)
+        return deleted
 
     # ---------------------------------------------------------- meta
 

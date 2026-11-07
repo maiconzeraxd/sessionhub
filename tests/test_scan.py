@@ -110,3 +110,37 @@ def test_scan_extra_repos(fake_home: Path, git_repo: Path, db: Database, tmp_pat
     stats = run_scan(db, cfg, user_home=fake_home)
     assert stats.repos == 1  # só o extra
     assert len(db.list_worktrees()) >= 1
+
+
+def test_scan_purga_eventos_antigos(fake_home: Path, db: Database, tmp_path: Path) -> None:
+    """O scan roda a retenção da tabela events (config.retention_days)."""
+    projects = fake_home / ".claude" / "projects" / "G--repo"
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, str(tmp_path), "v1")])
+    db.record_event("2020-01-01T00:00:00+00:00", "claude", "velho", "Stop")
+    db.record_event(datetime.now(UTC).isoformat(), "claude", "novo", "Stop")
+
+    run_scan(db, _config(db, tmp_path), user_home=fake_home)
+    assert db.last_events("claude", "velho") == []
+    assert len(db.last_events("claude", "novo")) == 1
+
+
+def test_scan_marca_missing_quando_transcript_sumiu(
+    fake_home: Path, db: Database, tmp_path: Path
+) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--repo"
+    fp = write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, str(tmp_path), "v1")])
+    run_scan(db, _config(db, tmp_path), user_home=fake_home)
+    assert db.list_sessions()[0]["status"] == "stopped"
+
+    fp.unlink()
+    run_scan(db, _config(db, tmp_path), user_home=fake_home)
+    rows = db.list_sessions()
+    # a sessão continua no índice (não some) — só muda o status
+    assert len(rows) == 1
+    assert rows[0]["status"] == "missing"
+    assert db.find_sessions(SID)[0]["status"] == "missing"
+
+    # transcript voltou ao disco → status restaura
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, str(tmp_path), "v1")])
+    run_scan(db, _config(db, tmp_path), user_home=fake_home)
+    assert db.find_sessions(SID)[0]["status"] in ("stopped", "forgotten")

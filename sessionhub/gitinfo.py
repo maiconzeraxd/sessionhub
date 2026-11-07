@@ -7,7 +7,10 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
 
@@ -18,6 +21,23 @@ log = get_logger(__name__)
 
 GIT_TIMEOUT = 20.0
 _MAX_WORKERS = 8
+
+# gh pr list é uma chamada de rede (~1s+ por repo): a TUI consulta a cada
+# rebuild, então cacheamos por repo com TTL de 5 minutos.
+_PR_TTL = 300.0
+_PR_CACHE: dict[str, tuple[float, dict[str, tuple[int, str]]]] = {}
+_PR_LOCK = threading.Lock()
+
+
+def parse_head_ts(raw: str) -> datetime | None:
+    """`git log -1 --format=%cI` (ISO 8601 com offset) → datetime UTC."""
+    try:
+        dt = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 class GitStatus(TypedDict):
@@ -154,8 +174,8 @@ def parse_status(out: str) -> GitStatus:
     }
 
 
-def repo_open_prs(repo_root: str) -> dict[str, tuple[int, str]]:
-    """PRs abertos por branch, via gh (vazio se gh indisponível/sem auth)."""
+def _fetch_open_prs(repo_root: str) -> dict[str, tuple[int, str]]:
+    """Chama `gh pr list` de verdade (sem cache)."""
     if shutil.which("gh") is None:
         return {}
     try:
@@ -197,6 +217,30 @@ def repo_open_prs(repo_root: str) -> dict[str, tuple[int, str]]:
     return out
 
 
+def clear_pr_cache() -> None:
+    """Zera o cache de PRs (testes; scan --full pode chamar antes)."""
+    with _PR_LOCK:
+        _PR_CACHE.clear()
+
+
+def repo_open_prs(repo_root: str, ttl: float = _PR_TTL) -> dict[str, tuple[int, str]]:
+    """PRs abertos por branch, via gh (vazio se gh indisponível/sem auth).
+
+    Cacheado por repo com TTL (5min por padrão) — cada rebuild da TUI não
+    refaz a chamada de rede. Falhas também são cacheadas (evita repetir um
+    timeout de 30s a cada scan).
+    """
+    now = time.monotonic()
+    with _PR_LOCK:
+        hit = _PR_CACHE.get(repo_root)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+    prs = _fetch_open_prs(repo_root)
+    with _PR_LOCK:
+        _PR_CACHE[repo_root] = (now, prs)
+    return prs
+
+
 def collect_worktrees(
     repo_root: str, with_status: bool = True, with_prs: bool = True
 ) -> list[Worktree]:
@@ -210,15 +254,17 @@ def collect_worktrees(
 
         def _fill_status(w: Worktree) -> None:
             out = run_git(["status", "--porcelain=v1", "--branch"], cwd=w.path)
-            if out is None:
-                return
-            info = parse_status(out)
-            w.branch = info["branch"] or w.branch
-            w.staged = info["staged"]
-            w.unstaged = info["unstaged"]
-            w.untracked = info["untracked"]
-            w.ahead = info["ahead"]
-            w.behind = info["behind"]
+            if out is not None:
+                info = parse_status(out)
+                w.branch = info["branch"] or w.branch
+                w.staged = info["staged"]
+                w.unstaged = info["unstaged"]
+                w.untracked = info["untracked"]
+                w.ahead = info["ahead"]
+                w.behind = info["behind"]
+            log_out = run_git(["log", "-1", "--format=%cI"], cwd=w.path)
+            if log_out:
+                w.head_ts = parse_head_ts(log_out)
 
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
             list(pool.map(_fill_status, worktrees))

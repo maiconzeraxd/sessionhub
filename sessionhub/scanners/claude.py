@@ -1,9 +1,11 @@
 """Scanner do Claude Code (`~/.claude/projects/**/*.jsonl`).
 
 Cada linha do transcript é um JSON. Campos usados (presentes nas linhas
-user/assistant): `sessionId`, `cwd`, `gitBranch`, `timestamp`, `message.content`
-(string ou lista de blocos `{type: text, text}`). `gitBranch` "HEAD" significa
-branch desconhecida — ignoramos e deixamos o git resolver.
+user/assistant): `cwd`, `gitBranch`, `timestamp`, `message.content` (string
+ou lista de blocos `{type: text, text}`). `gitBranch` "HEAD" significa branch
+desconhecida — ignoramos e deixamos o git resolver. O `sessionId` interno NÃO
+é usado como id: o id é o nome do arquivo (é ele que o `claude --resume`
+procura), porque o sessionId de linhas de subagente é o da sessão pai.
 
 O título é a primeira mensagem real do usuário (pulando isMeta, comandos
 locais `<command-*>` e subagentes), com fallback para o campo `summary`.
@@ -22,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..log import get_logger
-from ..models import STATUS_STOPPED, DiscoverResult, Session
+from ..models import STATUS_STOPPED, DiscoverResult, HarnessDiagnosis, Session
 
 log = get_logger(__name__)
 
@@ -113,14 +115,38 @@ class ClaudeScanner:
             projects_dir if projects_dir is not None else home / ".claude" / "projects"
         )
 
+    def diagnose(self) -> HarnessDiagnosis:
+        """Estado da origem do harness (para o doctor)."""
+        root = self.projects_dir
+        files = sum(1 for _ in root.rglob("*.jsonl")) if root.is_dir() else 0
+        note: str | None = None
+        problem = False
+        if not root.is_dir():
+            note = "não instalado (ou sem ~/.claude/projects)"
+        elif files == 0:
+            note = "projects existe mas nenhum transcript .jsonl"
+            problem = True
+        return HarnessDiagnosis(
+            name=self.name,
+            found=root.is_dir(),
+            path=str(root),
+            files=files,
+            note=note,
+            problem=problem,
+        )
+
     def discover(self, fingerprints: dict[str, tuple[float, int]] | None = None) -> DiscoverResult:
         result = DiscoverResult()
         if not self.projects_dir.is_dir():
             return result
         for fp in sorted(self.projects_dir.rglob("*.jsonl")):
             # subagentes são sidechains (o sessionId interno é o da sessão
-            # pai); não são sessões e não devem poluir o índice
-            if "subagents" in fp.relative_to(self.projects_dir).parts:
+            # pai), não são sessões e não devem poluir o índice. Dois formatos:
+            # pasta `subagents/` (atual) e `agent-*.jsonl` solto na pasta do
+            # projeto (versões antigas do Claude Code).
+            if "subagents" in fp.relative_to(self.projects_dir).parts or fp.name.startswith(
+                "agent-"
+            ):
                 continue
             key = str(fp)
             result.seen.add(key)
@@ -160,9 +186,16 @@ class ClaudeScanner:
         result.sessions = list(best.values())
 
     def parse_file(self, fp: Path, stat: os.stat_result | None = None) -> Session | None:
-        """Lê um transcript e devolve a Session (None se vazio/ilegível)."""
+        """Lê um transcript e devolve a Session (None se vazio/ilegível).
+
+        O id da sessão é o **nome do arquivo** (stem): é ele que o
+        `claude --resume` procura. O `sessionId` interno das linhas pode ser o
+        da sessão pai (subagente engolindo a sessão principal) — nunca é usado
+        como id. Se TODAS as mensagens são sidechain, o arquivo é um
+        subagente em formato antigo e não é uma sessão (None).
+        """
         st = os.stat(fp) if stat is None else stat
-        session_id: str | None = None
+        session_id = fp.stem
         cwd: str | None = None
         branch: str | None = None
         first_ts: datetime | None = None
@@ -170,6 +203,7 @@ class ClaudeScanner:
         title: str | None = None
         summary_title: str | None = None
         message_count = 0
+        sidechain_msgs = 0
         bad_lines = 0
 
         with fp.open("r", encoding="utf-8", errors="replace") as fh:
@@ -189,9 +223,6 @@ class ClaudeScanner:
                     if first_ts is None:
                         first_ts = ts
                     last_ts = ts
-                sid = rec.get("sessionId")
-                if isinstance(sid, str) and sid:
-                    session_id = sid
                 c = rec.get("cwd")
                 if isinstance(c, str) and c:
                     cwd = c
@@ -201,7 +232,9 @@ class ClaudeScanner:
                 if rtype in ("user", "assistant"):
                     sidechain = bool(rec.get("isSidechain"))
                     is_meta = bool(rec.get("isMeta"))
-                    if not sidechain and not is_meta:
+                    if sidechain:
+                        sidechain_msgs += 1
+                    elif not is_meta:
                         message_count += 1
                     if rtype == "user" and title is None and not sidechain and not is_meta:
                         msg = rec.get("message")
@@ -217,8 +250,9 @@ class ClaudeScanner:
         if bad_lines:
             log.info("%d linhas corrompidas em %s", bad_lines, fp)
 
-        if session_id is None:
-            session_id = fp.stem
+        # arquivo inteiro é sidechain de subagente (formato antigo): não é sessão
+        if sidechain_msgs and message_count == 0:
+            return None
         if title is None:
             title = summary_title
         if last_ts is None:

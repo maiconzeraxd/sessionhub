@@ -42,6 +42,8 @@ dir = "~/.sessionhub/backups"
 
 [retention]
 # Manter todos os snapshots dos últimos N dias; depois, 1 por semana.
+# O mesmo N vale para a tabela de eventos (hooks da fase 3): eventos mais
+# antigos que isso são apagados a cada scan.
 days = 30
 weekly = true
 

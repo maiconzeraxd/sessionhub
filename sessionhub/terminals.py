@@ -18,6 +18,28 @@ _CANDIDATES = {
 }
 
 
+def current_terminal_program() -> str | None:
+    """Terminal em que o SessionHub está rodando AGORA (nome curto).
+
+    Prioriza o terminal atual na ordem de abertura: comandos `cli` (kitty @,
+    wezterm cli) só funcionam de dentro do terminal certo. None = não dá
+    para saber.
+    """
+    if os.environ.get("KITTY_WINDOW_ID"):
+        return "kitty"
+    if os.environ.get("WEZTERM_PANE"):
+        return "wezterm"
+    tp = (os.environ.get("TERM_PROGRAM") or "").lower()
+    return {
+        "kitty": "kitty",
+        "ghostty": "ghostty",
+        "wezterm": "wezterm",
+        "tmux": "tmux",
+        "iterm.app": "iterm",
+        "apple_terminal": "apple-terminal",
+    }.get(tp)
+
+
 def detect() -> dict[str, object]:
     """Best-effort: terminal em uso + terminais disponíveis."""
     inside_tmux = bool(os.environ.get("TMUX"))

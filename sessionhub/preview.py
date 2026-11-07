@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
+from .fmt import age
 from .log import get_logger
 from .models import STATUS_ICONS
 from .scanners.claude import (
@@ -152,22 +152,6 @@ def _fmt_dt(iso: str | None) -> str:
     return local.strftime("%d/%m/%Y %H:%M")
 
 
-def _age(iso: str | None) -> str:
-    dt = parse_timestamp(iso)
-    if dt is None:
-        return "—"
-    secs = int((datetime.now(UTC) - dt).total_seconds())
-    if secs < 0:
-        secs = 0
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}min"
-    if secs < 86400:
-        return f"{secs // 3600}h"
-    return f"{secs // 86400}d"
-
-
 def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None) -> str:
     """Painel de pré-visualização completo (markdown p/ o widget da TUI)."""
     icon = STATUS_ICONS.get(row.get("status") or "", "❔")
@@ -183,7 +167,7 @@ def preview_markdown(row: dict[str, Any], worktree: dict[str, Any] | None = None
     mark = "" if exists else " ⚠ *(caminho não existe mais)*"
     out.append(f"- **worktree:** `{wt}`{mark}")
     out.append(
-        f"- **atividade:** {_age(row.get('last_activity'))} atrás"
+        f"- **atividade:** {age(row.get('last_activity'))} atrás"
         f" · criada em {_fmt_dt(row.get('created_at'))} · {row.get('message_count', 0)} msgs"
     )
     if row.get("note"):

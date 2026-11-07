@@ -186,15 +186,96 @@ def test_transcript_de_subagente_e_ignorado(fake_home: Path) -> None:
     assert result.sessions[0].title == "sessão principal"
 
 
-def test_dedup_mesmo_session_id_fica_o_mais_recente(fake_home: Path) -> None:
+def test_agent_jsonl_solto_na_pasta_e_ignorado(fake_home: Path) -> None:
+    """Formato antigo: subagente como agent-*.jsonl direto na pasta do projeto
+    (com sessionId da sessão pai) — não pode engolir a sessão principal."""
     projects = fake_home / ".claude" / "projects" / "G--proj"
     write_transcript(
         projects / f"{SID}.jsonl",
-        [make_user_line(SID, "G:\\proj", "antigo", ts="2026-11-01T10:00:00.000Z")],
+        [make_user_line(SID, "G:\\proj", "sessão principal", ts="2026-11-01T10:00:00Z")],
+    )
+    old_format = write_transcript(
+        projects / "agent-99998888.jsonl",
+        [
+            # sessionId = o da pai; é por isso que o nome do arquivo decide
+            make_user_line(SID, "G:\\proj", "subagente antigo", ts="2026-11-01T11:00:00Z")
+        ],
+    )
+    result = ClaudeScanner(fake_home).discover()
+    assert len(result.sessions) == 1
+    assert result.sessions[0].session_id == SID
+    assert result.sessions[0].title == "sessão principal"
+    assert str(old_format) not in result.seen
+
+
+def test_arquivo_todo_sidechain_nao_e_sessao(fake_home: Path) -> None:
+    """Mesmo com outro nome, transcript só com linhas sidechain não é sessão."""
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, "G:\\proj", "principal")])
+    write_transcript(
+        projects / "77777777-6666-5555-4444-333333333333.jsonl",
+        [make_user_line(SID, "G:\\proj", "sidechain", sidechain=True)],
+    )
+    result = ClaudeScanner(fake_home).discover()
+    assert [s.session_id for s in result.sessions] == [SID]
+
+
+def test_id_da_sessao_e_o_stem_do_arquivo(fake_home: Path) -> None:
+    """O claude --resume procura pelo nome do arquivo — o sessionId interno
+    (que em subagentes é o da pai) nunca define o id."""
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+        [make_user_line(SID, "G:\\proj", "mensagem")],  # sessionId diferente do stem
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.session_id == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    assert s.resume_command == "claude --resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+# ------------------------------------------------------------- diagnose (doctor)
+
+
+def test_diagnose_encontra_transcripts(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, "G:\\proj", "oi")])
+    diag = ClaudeScanner(fake_home).diagnose()
+    assert diag.name == "claude"
+    assert diag.found is True
+    assert diag.files == 1
+    assert diag.note is None
+    assert diag.problem is False
+
+
+def test_diagnose_nao_instalado(fake_home: Path) -> None:
+    diag = ClaudeScanner(fake_home / "nao-existe").diagnose()
+    assert diag.found is False
+    assert diag.files == 0
+    assert diag.note is not None
+    assert diag.problem is False  # não instalado é nota, não problema
+
+
+def test_diagnose_origem_vazia_e_problema(fake_home: Path) -> None:
+    """Projects existe mas sem transcripts → problema (o doctor pinta vermelho)."""
+    (fake_home / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+    diag = ClaudeScanner(fake_home).diagnose()
+    assert diag.found is True
+    assert diag.files == 0
+    assert diag.note is not None
+    assert diag.problem is True
+
+
+def test_dedup_mesmo_stem_em_pastas_diferentes(fake_home: Path) -> None:
+    """Mesmo stem em dois projetos: fica o mais recente (safety net)."""
+    p1 = fake_home / ".claude" / "projects" / "G--um"
+    p2 = fake_home / ".claude" / "projects" / "G--dois"
+    write_transcript(
+        p1 / f"{SID}.jsonl",
+        [make_user_line(SID, "G:\\um", "antigo", ts="2026-11-01T10:00:00.000Z")],
     )
     write_transcript(
-        projects / f"{SID}-continua.jsonl",
-        [make_user_line(SID, "G:\\proj", "novo", ts="2026-11-02T10:00:00.000Z")],
+        p2 / f"{SID}.jsonl",
+        [make_user_line(SID, "G:\\dois", "novo", ts="2026-11-02T10:00:00.000Z")],
     )
     result = ClaudeScanner(fake_home).discover()
     assert len(result.sessions) == 1

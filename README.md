@@ -5,31 +5,45 @@ harnesses nas próximas fases) — com os worktrees de git de cada uma — num
 lugar só: uma TUI no terminal.
 
 ```
-📁 North (G:\…) · 7 worktrees
+📁 North (~/dev/north) · 7 worktrees
   🌿 main · ✎12 ↑3 · PR#42
     🟡 conserta o pipeline de build · claude · 5min · 8m
     ⚪ refatora o scanner · claude · 2d · 21m 📌
-  🌂 feat/imgui · sem sessões
+  🔴 feat/imgui · esquecida · 3d        ← trabalho não entregue, sem sessão
+  🌿 feat/json · sem sessões · 2d
+  🗄 migra o banco · claude · 5d         ← transcript sumiu da origem
 📂 (sem repositório) · 3 pastas
 ```
 
 Fases (a do momento marcada):
 1. ✅ Scanner Claude Code + worktrees git + índice SQLite + `sessionhub ls`
 2. ✅ TUI (árvore, filtros, busca, preview) + abrir sessão no terminal
-3. ⬜ Monitoramento ao vivo (hooks + psutil + watcher): 🟢 rodando / 🟡 esperando você
+3. ⬜ Monitoramento ao vivo (hooks + psutil): 🟢 rodando / 🟡 esperando você
+   (o watcher de transcripts — scan quente na TUI — já está ativo)
 4. ⬜ Backup incremental + restore + agendamento + age
 5. ⬜ Scanners Codex (`.jsonl.zst`), Gemini CLI, Aider + busca full-text FTS5
 6. ⬜ Daemon + notificações + doctor polish
 
 ## Instalação
 
-Requisitos: Python 3.11+, git no PATH. (uv recomendado; o venv não precisa de pip.)
+Plataformas: **Windows**, **Linux** e **macOS**. Requisitos: Python 3.11+,
+git no PATH. (uv recomendado; o venv não precisa de pip.)
+
+Windows (PowerShell):
 
 ```powershell
 cd G:\_IA\Aplicação
 uv venv
 uv pip install -e ".[dev]" --python .venv\Scripts\python.exe
 .venv\Scripts\sessionhub.exe --help
+```
+
+Linux/macOS:
+
+```bash
+uv venv
+uv pip install -e ".[dev]" --python .venv/bin/python
+.venv/bin/sessionhub --help
 ```
 
 Ou com pip/pipx em qualquer máquina: `pipx install .`.
@@ -77,7 +91,7 @@ sessionhub doctor                   # diagnóstico de harnesses/ferramentas/term
 | `n` | adicionar/editar nota 📌 e tags da sessão |
 | `c` | copiar o comando de retomada |
 | `o` | abrir o worktree no editor (`code .`) |
-| `b` | alternar branch/estado git no preview |
+| `b` | backup das sessões (fase 4 — hoje só avisa) |
 | `x` | arquivar/ocultar sessão (reversível com `H`) |
 | `H` | mostrar/ocultar arquivadas |
 | `s` | re-escanear (dentro da TUI) |
@@ -89,13 +103,32 @@ O painel direito mostra o **pedido inicial** (primeira mensagem real do
 usuário, com invólucros de paste/reminder desembrulhados), as **últimas
 mensagens** da conversa (👤/🤖, com timestamps), estado do git
 (dirty/ahead/behind/PR), comando de retomada e a nota — rola com o mouse.
-Sem daemon: refresh automático a cada 5s comparando uma assinatura do índice.
+A leitura do transcript roda fora do event loop (transcripts de GB não
+travam a TUI) com debounce e cache por (caminho, mtime).
+
+Refresh: um **watcher** (watchdog) observa `~/.claude/projects` e dispara um
+scan quente quando transcripts mudam (~2s); sem watchdog instalado — ou fora
+dessas pastas — vale o refresh de 5s comparando a assinatura do índice.
+Rebuilds preservam worktrees colapsadas e a rolagem; a busca tem debounce.
 
 ### Abertura de sessão
 
-A ordem de resolução do terminal é: `open_command` do config.toml → tmux (se
-dentro de `$TMUX`) → Windows Terminal (`wt.exe -d <worktree>`) → emadores
-POSIX conhecidos. No Windows Terminal daqui, o comando gerado é:
+Ordem de resolução do terminal:
+
+1. `open_command` do config.toml — template dividido em argumentos **antes**
+   da substituição (`{cwd}`/`{cmd}`), então caminhos com espaço não quebram;
+2. `terminal` explícito do config (`kitty`, `wezterm`, `tmux`, `wt`,
+   `ghostty`, `iterm`, `apple-terminal`, `alacritty`, `gnome-terminal`, …);
+3. o terminal em que o SessionHub roda (`$KITTY_WINDOW_ID`, `$WEZTERM_PANE`,
+   `$TMUX`, `$TERM_PROGRAM`) — abre aba/pane/janela nova na mesma sessão;
+4. padrão da plataforma (Windows: `wt`; macOS: kitty/ghostty/wezterm/iTerm/
+   Terminal.app; Linux: kitty/wezterm/alacritty/gnome-terminal/konsole/
+   x-terminal-emulator).
+
+Launchers "cli" (kitty `@`, wezterm `cli`, tmux, osascript no macOS) são
+**verificados** — o SessionHub checa o retorno e, se falhou, tenta o próximo
+da lista; abrir nunca falha em silêncio. No Windows Terminal, o comando
+gerado é:
 
 ```
 wt.exe -d G:\Dev\North cmd /k claude --resume <id>
@@ -114,10 +147,11 @@ Criado com comentários no primeiro uso. Campos principais:
 | campo | padrão | descrição |
 |---|---|---|
 | `forgotten_hours` | `24` | worktree sujo + sem atividade além disso = 🔴 esquecido |
-| `terminal` | `auto` | `wt` / `tmux` / `auto` |
-| `open_command` | — | template com `{cwd}` e `{cmd}` |
+| `terminal` | `auto` | forçar um terminal: `wt`/`kitty`/`wezterm`/`tmux`/… |
+| `open_command` | — | template com `{cwd}` e `{cmd}` (tem prioridade sobre tudo) |
 | `editor` | `code` | usado pela tecla `o` |
 | `extra_repos` | `[]` | repos sem sessão Claude (ex.: só Codex) |
+| `retention.days` | `30` | eventos (hooks, fase 3) mais velhos que isso saem a cada scan |
 
 App data vive só em `~/.sessionhub/` (`config.toml`, `index.db`, `logs/`).
 Override para testes: variável `SESSIONHUB_HOME`.
@@ -126,14 +160,17 @@ Override para testes: variável `SESSIONHUB_HOME`.
 
 ```
 sessionhub/
-  cli.py          Typer: scan/ls/open/doctor + invoca a TUI sem subcomando
+  cli.py          Typer: scan/ls/show/open/doctor + invoca a TUI sem subcomando
   tui.py          Textual: árvore repo→worktree→sessão, preview, modais
   scan.py         orquestração: scanners → git → índice (uma passada)
-  scanners/       protocolo Scanner (name + discover) + claude.py
-  db.py           SQLite (WAL): sessions, worktrees, events, meta
-  gitinfo.py      worktree list/status/PRs (chamadas paralelas)
+  scanners/       protocolo Scanner (name + discover + diagnose) + claude.py
+  db.py           SQLite (WAL): sessions, worktrees, events, meta (+migrações)
+  gitinfo.py      worktree list/status/PRs (paralelo; PRs com cache de 5min)
   preview.py      tail do transcript → markdown
-  open.py         monta+dispara o comando do terminal
+  open.py         resolução+verificação de terminal, montagem do comando
+  terminals.py    detecção do terminal atual (env) p/ abertura de sessão
+  watcher.py      watchdog → scan quente na TUI quando transcripts mudam
+  fmt.py          formatadores compartilhados (idade, badges git, caminhos)
   config.py       config.toml + $SESSIONHUB_HOME
 ```
 
@@ -141,11 +178,12 @@ sessionhub/
 
 ```python
 # meu_scanner.py — instalável à parte com entry point group "sessionhub.scanners"
-from sessionhub.models import DiscoverResult, Session
+from sessionhub.models import DiscoverResult, HarnessDiagnosis, Session
 
 class CodexScanner:
     name = "codex"
     def discover(self, fingerprints=None) -> DiscoverResult: ...
+    def diagnose(self) -> HarnessDiagnosis: ...   # opcional p/ plugins
 ```
 
 ```toml
@@ -167,18 +205,28 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
 - **Pre-filtro de linhas**: só linhas com marcador `"type":"user"/"assistant"/"summary"`
   passam por `json.loads` (perf em transcripts de GB).
 - **Subagentes não são sessões**: `projects/<p>/subagents/*.jsonl` é pulado
-  (o sessionId interno é o da sessão pai).
+  (o sessionId interno é o da sessão pai); id da sessão = nome do arquivo
+  (é o que o `claude --resume` procura).
+- **🗄 Missing**: transcript sumiu da origem → status `missing` (a sessão
+  fica no índice para retomar via repo principal; volta a `stopped` se o
+  arquivo reaparecer).
+- **🔴 Worktrees esquecidas**: trabalho não entregue (dirty/ahead) + sem
+  sessão viva aparecem na árvore mesmo sem sessão indexada.
 - **Branch vem do git, não do transcript**: `gitBranch:"HEAD"` é unreliable;
   o branch real vem do `git status` do worktree.
 - **Títulos**: primeira mensagem real do usuário, pulando comandos/meta/
   task-notifications, desembrulhando `<pasted_content>`/`<system-reminder>`;
   fallback para o `summary` (escrito pelo Claude em compacts).
+- **PRs com cache**: `gh pr list` roda com TTL de 5min por repo (rede é
+  lenta; `scan --full` zera o cache).
+- **Migrações**: o schema evolui via `PRAGMA user_version` — um `index.db`
+  antigo é migrado na abertura, sem perder dados.
 
 ## Desenvolvimento
 
 ```powershell
 uv pip install -e ".[dev]" --python .venv\Scripts\python.exe
-python -m pytest      # 80 testes (fixtures sintéticas em tmp; nada real)
+python -m pytest      # 134 testes (fixtures sintéticas em tmp; nada real)
 python -m ruff check .
 python -m mypy
 ```

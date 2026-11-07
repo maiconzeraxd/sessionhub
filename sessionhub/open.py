@@ -1,26 +1,45 @@
 """Abre uma sessão num terminal novo (foca pane do tmux na fase 3).
 
-Ordem de escolha do terminal:
-1. `open_command` do config.toml (template com {cwd} e {cmd});
-2. tmux, se estivermos dentro do tmux (ou config terminal = "tmux");
-3. detecção por plataforma: Windows → wt.exe; macOS → iTerm2/Terminal/Ghostty/
-   WezTerm/kitty; Linux → kitty/WezTerm/Alacritty/gnome-terminal/konsole.
+Ordem de escolha dos launchers (o primeiro que abrir de verdade ganha):
+1. `open_command` do config.toml (template com {cwd} e {cmd} — o template é
+   dividido ANTES de substituir, para sobreviver a caminhos com espaço);
+2. `terminal` explícito do config ("wt", "tmux", "kitty", "wezterm", …);
+3. o terminal em que o SessionHub está rodando agora (KITTY_WINDOW_ID /
+   WEZTERM_PANE / TERM_PROGRAM) — comandos `cli` (kitty @, wezterm cli)
+   só funcionam do terminal certo;
+4. tmux, se estivermos dentro do $TMUX;
+5. padrão da plataforma: Windows → wt.exe; macOS → iTerm2/Terminal/Ghostty/
+   kitty/WezTerm; Linux → kitty/WezTerm/Alacritty/gnome-terminal/konsole.
+
+Launchers "cli" (kitty @ / wezterm cli / tmux / osascript) falam com um
+terminal que já existe: rodam com subprocess.run + timeout e o código de
+saída é verificado — falhou, cai para o próximo candidato em vez de
+"abrir sem abrir nada". Launchers "spawn" (GUI) são destacados e
+fire-and-forget, mas um OSError ao lançar também desempata para o próximo.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
 from .log import get_logger
-from .terminals import detect
+from .terminals import current_terminal_program
 
 log = get_logger(__name__)
+
+CLI_TIMEOUT = 15.0  # kitty @/wezterm cli/tmux/osascript: limiar de "abriu?"
+
+# session_id precisa ser um token de shell inofensivo antes de ser embutido
+# em cmd /k, sh -c, tmux ou AppleScript (ids do Claude são UUIDs).
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+@/\\-]{2,127}$")
 
 
 @dataclass
@@ -30,122 +49,306 @@ class OpenResult:
     message: str = ""
 
 
+@dataclass
+class Launcher:
+    """Um jeito de abrir o terminal. `kind`:
+
+    - "cli": fala com um terminal existente (kitty @, wezterm cli, tmux,
+      osascript) — verificado com subprocess.run + rc;
+    - "spawn": lança um GUI novo (Popen destacado, fire-and-forget).
+    """
+
+    argv: list[str]
+    kind: str = "spawn"
+    label: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.label:
+            self.label = self.argv[0] if self.argv else "?"
+
+    @property
+    def display(self) -> str:
+        return " ".join(self.argv)
+
+
 def _split_template(rendered: str) -> list[str]:
     """Split respeitando aspas SEM comer barras invertidas do Windows."""
     tokens = shlex.split(rendered, posix=False)
     return [t.strip("\"'") for t in tokens]
 
 
-def _sh_quote(path: str) -> str:
-    return shlex.quote(path)
+def _render_template(template: str, cwd: str, cmd: str) -> list[str]:
+    """Divide o template ANTES de substituir {cwd}/{cmd} dentro de cada
+    argumento — substituir antes quebrava com espaço no caminho
+    (vira dois argumentos) e com aspas no comando."""
+    tokens = _split_template(template)
+    return [t.replace("{cwd}", cwd).replace("{cmd}", cmd) for t in tokens]
 
 
-def build_open_argv(cwd: str, cmd: str, config: Config) -> tuple[list[str] | None, str]:
-    """Monta o argv do terminal. Retorna (argv, comando legível).
+def _sh_quote(text: str) -> str:
+    return shlex.quote(text)
 
-    argv None = nenhum terminal encontrado (chamador decide o que fazer).
+
+# ------------------------------------------------------------- builders POSIX
+
+
+def _apple_inner(cwd: str, cmd: str) -> str:
+    """Comando interno do AppleScript: `sh -c 'cd … && cmd'`.
+
+    Funciona tanto se o app executa a string via shell (Terminal) quanto
+    direto (iTerm): o sh -c explícito garante o && em ambos.
     """
-    if config.open_command:
-        argv = _split_template(config.open_command.replace("{cwd}", cwd).replace("{cmd}", cmd))
-        return argv, " ".join(argv)
-
-    term = (config.terminal or "auto").lower()
-    inside_tmux = bool(os.environ.get("TMUX"))
-    use_tmux = term == "tmux" or (term == "auto" and inside_tmux)
-    if use_tmux and shutil.which("tmux"):
-        argv = ["tmux", "new-window", "-c", cwd, cmd]
-        return argv, " ".join(argv)
-
-    system = os.name
-    if system == "nt":
-        if shutil.which("wt.exe"):
-            argv = ["wt.exe", "-d", cwd, "cmd", "/k", cmd]
-            return argv, " ".join(argv)
-        return None, cmd
-
-    # POSIX (macOS/Linux)
-    cmd_tokens = shlex.split(cmd)
-    if system == "posix" and shutil.which("wezterm"):
-        argv = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", *cmd_tokens]
-        return argv, " ".join(argv)
-    for binary, builder in _posix_candidates():
-        if not shutil.which(binary):
-            continue
-        argv = builder(cwd, cmd, cmd_tokens)
-        if argv:
-            return argv, " ".join(argv)
-    return None, cmd
+    return f"sh -c {shlex.quote(f'cd {cwd} && {cmd}')}"
 
 
-def _posix_candidates() -> list[tuple[str, Any]]:
-    def kitty_at(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["kitty", "@", "launch", "--type", "tab", "--cwd", cwd, *tokens]
+def _applescript_literal(text: str) -> str:
+    """Escapa para dentro de um literal de string AppleScript (\\ e ")."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
-    def kitty_new(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["kitty", "--directory", cwd, *tokens]
 
-    def alacritty(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["alacritty", "-e", "sh", "-c", f"cd {_sh_quote(cwd)} && {cmd}"]
+def _osascript_argv(app: str, action: str, cwd: str, cmd: str) -> list[str]:
+    literal = _applescript_literal(_apple_inner(cwd, cmd))
+    script = f'tell application "{app}" to {action} "{literal}"'
+    return ["osascript", "-e", script]
 
-    def gnome(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["gnome-terminal", "--", "sh", "-c", f"cd {_sh_quote(cwd)} && {cmd}"]
 
-    def konsole(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["konsole", "-e", "sh", "-c", f"cd {_sh_quote(cwd)} && {cmd}"]
-
-    def xterm_default(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["x-terminal-emulator", "-e", "sh", "-c", f"cd {_sh_quote(cwd)} && {cmd}"]
-
-    def osascript_terminal(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        script = f'tell application "Terminal" to do script "cd {_apple_quote(cwd)} && {cmd}"'
-        return ["osascript", "-e", script]
-
-    def osascript_iterm(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        script = (
-            f'tell application "iTerm" to create window with default profile '
-            f'command "cd {_apple_quote(cwd)} && {cmd}"'
+def _kitty_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("kitty"):
+        return None
+    tokens = shlex.split(cmd)
+    if os.environ.get("KITTY_WINDOW_ID"):
+        # dentro do kitty: janela no MESMO kitty (remote control)
+        return Launcher(
+            ["kitty", "@", "launch", "--type", "tab", "--cwd", cwd, *tokens],
+            "cli",
+            "kitty @",
         )
-        return ["osascript", "-e", script]
+    return Launcher(["kitty", "--directory", cwd, *tokens], "spawn", "kitty")
 
-    def ghostty(cwd: str, cmd: str, tokens: list[str]) -> list[str]:
-        return ["ghostty", "--working-directory", cwd, "-e", *tokens]
 
-    if detect().get("system") == "Darwin":
-        return [
-            ("kitty", kitty_at),
-            ("ghostty", ghostty),
-            ("wezterm", lambda c, m, t: ["wezterm", "cli", "spawn", "--cwd", c, "--", *t]),
-            ("osascript", osascript_iterm),
-            ("osascript", osascript_terminal),
-        ]
+def _wezterm_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("wezterm"):
+        return None
+    tokens = shlex.split(cmd)
+    if os.environ.get("WEZTERM_PANE"):
+        # dentro do wezterm: pane novo no MESMO wezterm
+        return Launcher(
+            ["wezterm", "cli", "spawn", "--cwd", cwd, "--", *tokens],
+            "cli",
+            "wezterm cli",
+        )
+    return Launcher(
+        ["wezterm", "start", "--always-new-process", "--cwd", cwd, "--", *tokens],
+        "spawn",
+        "wezterm start",
+    )
+
+
+def _ghostty_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("ghostty"):
+        return None
+    tokens = shlex.split(cmd)
+    return Launcher(["ghostty", "--working-directory", cwd, "-e", *tokens], "spawn", "ghostty")
+
+
+def _tmux_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("tmux"):
+        return None
+    return Launcher(["tmux", "new-window", "-c", cwd, cmd], "cli", "tmux")
+
+
+def _wt_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("wt.exe"):
+        return None
+    return Launcher(["wt.exe", "-d", cwd, "cmd", "/k", cmd], "spawn", "wt")
+
+
+def _sh_c_launcher(binary: str, *prefix: str) -> Callable[[str, str], Launcher | None]:
+    """Builder genérico: <binary> <prefix…> sh -c 'cd … && cmd'."""
+
+    def build(cwd: str, cmd: str) -> Launcher | None:
+        if not shutil.which(binary):
+            return None
+        return Launcher(
+            [*prefix, "sh", "-c", f"cd {_sh_quote(cwd)} && {cmd}"],
+            "spawn",
+            binary,
+        )
+
+    return build
+
+
+_alacritty = _sh_c_launcher("alacritty", "-e")
+_gnome = _sh_c_launcher("gnome-terminal", "--")
+_konsole = _sh_c_launcher("konsole", "-e")
+_xterm = _sh_c_launcher("x-terminal-emulator", "-e")
+
+
+def _iterm_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("osascript"):
+        return None
+    argv = _osascript_argv(
+        "iTerm", "create window with default profile command", cwd, cmd
+    )
+    return Launcher(argv, "cli", "iTerm (osascript)")
+
+
+def _terminal_app_launcher(cwd: str, cmd: str) -> Launcher | None:
+    if not shutil.which("osascript"):
+        return None
+    argv = _osascript_argv("Terminal", "do script", cwd, cmd)
+    return Launcher(argv, "cli", "Terminal.app (osascript)")
+
+
+_BUILDERS: dict[str, Callable[[str, str], Launcher | None]] = {
+    "wt": _wt_launcher,
+    "tmux": _tmux_launcher,
+    "kitty": _kitty_launcher,
+    "wezterm": _wezterm_launcher,
+    "ghostty": _ghostty_launcher,
+    "alacritty": _alacritty,
+    "gnome-terminal": _gnome,
+    "gnome": _gnome,
+    "konsole": _konsole,
+    "x-terminal-emulator": _xterm,
+    "xterm": _xterm,
+    "iterm": _iterm_launcher,
+    "iterm2": _iterm_launcher,
+    "apple-terminal": _terminal_app_launcher,
+    "terminal": _terminal_app_launcher,
+}
+
+# apelidos aceitos no config.terminal
+_ALIASES = {
+    "windows-terminal": "wt",
+    "windowsterminal": "wt",
+    "wt.exe": "wt",
+    "iterm.app": "iterm",
+    "apple_terminal": "apple-terminal",
+}
+
+
+def _platform_defaults() -> list[str]:
+    if os.name == "nt":
+        return ["wt"]
+    if hasattr(os, "uname") and os.uname().sysname == "Darwin":
+        return ["kitty", "ghostty", "wezterm", "iterm", "apple-terminal"]
     return [
-        ("kitty", kitty_at),
-        ("kitty", kitty_new),
-        ("alacritty", alacritty),
-        ("gnome-terminal", gnome),
-        ("konsole", konsole),
-        ("x-terminal-emulator", xterm_default),
+        "kitty",
+        "wezterm",
+        "alacritty",
+        "gnome-terminal",
+        "konsole",
+        "x-terminal-emulator",
     ]
 
 
-def _apple_quote(path: str) -> str:
-    return path.replace('"', '\\"')
+def build_launchers(cwd: str, cmd: str, config: Config) -> list[Launcher]:
+    """Launchers candidatos, em ordem de prioridade."""
+    if config.open_command:
+        argv = _render_template(config.open_command, cwd, cmd)
+        return [Launcher(argv, "spawn", "open_command")]
+
+    term = (config.terminal or "auto").strip().lower()
+    term = _ALIASES.get(term, term)
+
+    order: list[str] = []
+    # 1. terminal explícito do config ("wt", "kitty", "tmux", …)
+    if term and term != "auto" and term not in order:
+        order.append(term)
+    # 2. terminal em que estamos agora (kitty @/wezterm cli só funcionam daqui)
+    hint = current_terminal_program()
+    if hint and hint not in order:
+        order.append(hint)
+    # 3. dentro do tmux → janela no tmux atual
+    if os.environ.get("TMUX") and "tmux" not in order:
+        order.append("tmux")
+    # 4. padrões da plataforma
+    for name in _platform_defaults():
+        if name not in order:
+            order.append(name)
+
+    launchers: list[Launcher] = []
+    for name in order:
+        builder = _BUILDERS.get(name)
+        if builder is None:
+            continue
+        launcher = builder(cwd, cmd)
+        if launcher is not None:
+            launchers.append(launcher)
+    return launchers
 
 
-def _launch(argv: list[str]) -> None:
+def build_open_argv(cwd: str, cmd: str, config: Config) -> tuple[list[str] | None, str]:
+    """Monta o argv do terminal preferido. Retorna (argv, comando legível).
+
+    argv None = nenhum terminal encontrado (chamador decide o que fazer).
+    """
+    launchers = build_launchers(cwd, cmd, config)
+    if not launchers:
+        return None, cmd
+    return launchers[0].argv, launchers[0].display
+
+
+# ------------------------------------------------------------- disparo
+
+
+def _detach_kwargs() -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
+    return kwargs
+
+
+def _launch(argv: list[str]) -> None:
+    """Popen destacado (fire-and-forget) — GUI terminals."""
     subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        **kwargs,
+        **_detach_kwargs(),
     )
     log.info("abriu terminal: %s", argv)
+
+
+def run_launcher(launcher: Launcher, timeout: float = CLI_TIMEOUT) -> bool:
+    """Executa um launcher; True = abriu de verdade.
+
+    "cli": subprocess.run com timeout — o rc diz se o terminal atendeu
+    (kitty @ sem remote control, wezterm cli sem instância etc. falham
+    aqui em vez de "abrir sem abrir nada"). "spawn": Popen destacado;
+    OSError ao lançar devolve False (binário sumiu, args ruins).
+    """
+    if launcher.kind == "cli":
+        try:
+            proc = subprocess.run(
+                launcher.argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                text=True,
+                errors="replace",
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("launcher %s falhou: %s", launcher.label, exc)
+            return False
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()[:200]
+            log.warning(
+                "launcher %s rc=%d: %s", launcher.label, proc.returncode, err
+            )
+            return False
+        return True
+    try:
+        _launch(launcher.argv)
+    except OSError as exc:
+        log.warning("launcher %s falhou ao lançar: %s", launcher.label, exc)
+        return False
+    return True
 
 
 def open_session(
@@ -166,18 +369,42 @@ def open_session(
     if not cmd:
         return OpenResult("error", None, "sessão sem comando de retomada")
 
-    argv, display = build_open_argv(cwd, cmd, config)
-    if argv is None:
-        return OpenResult(
-            "error", display, "nenhum terminal detectado — configure [terminal] ou open_command"
-        )
+    if not dry_run:
+        sid = str(row.get("session_id") or "")
+        if not _SAFE_SESSION_ID_RE.fullmatch(sid):
+            # id vem do nome do arquivo no disco; se não for um token
+            # inofensivo, não embutimos em cmd /k, sh -c, tmux, AppleScript
+            return OpenResult(
+                "error",
+                cmd,
+                f"session_id suspeito para execução ({sid!r}) — copie o comando "
+                "e rode manualmente",
+            )
+
+    launchers = build_launchers(cwd, cmd, config)
     if dry_run:
-        return OpenResult("dry_run", display, display)
-    try:
-        _launch(argv)
-    except OSError as exc:
-        return OpenResult("error", display, f"falha ao lançar: {exc}")
-    return OpenResult("opened", display, f"{display}")
+        if launchers:
+            return OpenResult("dry_run", launchers[0].display, launchers[0].display)
+        # sem terminal instalado: --dry-run não é erro, só mostra o comando
+        return OpenResult("dry_run", cmd, cmd)
+
+    failed: list[str] = []
+    for launcher in launchers:
+        if run_launcher(launcher):
+            return OpenResult("opened", launcher.display, launcher.display)
+        failed.append(launcher.label)
+
+    if not failed:
+        return OpenResult(
+            "error",
+            cmd,
+            "nenhum terminal detectado — configure terminal ou open_command no config.toml",
+        )
+    return OpenResult(
+        "error",
+        cmd,
+        f"nenhum terminal abriu (tentados: {', '.join(failed)}) — comando: {cmd}",
+    )
 
 
 def open_in_editor(path: str, config: Config) -> OpenResult:

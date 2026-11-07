@@ -16,20 +16,26 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from ..log import get_logger
-from ..models import DiscoverResult
+from ..models import DiscoverResult, HarnessDiagnosis
 
 log = get_logger(__name__)
 
 
 @runtime_checkable
 class Scanner(Protocol):
-    """Contrato de um scanner de harness."""
+    """Contrato de um scanner de harness.
+
+    `diagnose` é opcional para plugins (o doctor usa getattr) — builtins
+    sempre implementam.
+    """
 
     name: str
 
     def discover(
         self, fingerprints: dict[str, tuple[float, int]] | None = None
     ) -> DiscoverResult: ...
+
+    def diagnose(self) -> HarnessDiagnosis: ...
 
 
 def builtin_scanners(user_home: Path | None = None) -> list[Scanner]:

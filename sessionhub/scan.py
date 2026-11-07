@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .config import Config
 from .db import Database
-from .gitinfo import collect_worktrees, toplevel
+from .gitinfo import clear_pr_cache, collect_worktrees, toplevel
 from .log import get_logger
 from .models import ScanStats, Worktree
 from .scanners import available_scanners
@@ -35,10 +35,13 @@ def run_scan(
     """
     t0 = time.perf_counter()
     stats = ScanStats()
+    if full:
+        clear_pr_cache()  # --full também refaz as chamadas de PR
     scanners = available_scanners(user_home)
     stats.harnesses = [s.name for s in scanners]
 
     sessions = []
+    seen_by_harness: dict[str, set[str]] = {}
     for scanner in scanners:
         fingerprints = None if full else db.get_fingerprints(scanner.name)
         result = scanner.discover(fingerprints)
@@ -46,6 +49,7 @@ def run_scan(
         stats.sessions_skipped += result.skipped
         stats.errors += result.errors
         sessions.extend(result.sessions)
+        seen_by_harness[scanner.name] = result.seen
 
     # ---- repos/worktrees ------------------------------------------------
     cwd_to_wt: dict[str, str | None] = {}
@@ -94,8 +98,13 @@ def run_scan(
                 s.branch = info.branch or s.branch
 
     db.upsert_sessions(sessions)
+    # sessões cujo transcript sumiu do disco → 'missing' (🗄); quem voltou é
+    # restaurado. Importa para o backup (fase 4) e para não listar fantasmas.
+    for harness, seen in seen_by_harness.items():
+        db.mark_missing(harness, seen)
     db.set_meta("last_scan", datetime.now(UTC).isoformat())
     db.recompute_status(config.forgotten_hours)
+    db.purge_events(config.retention_days)  # eventos velhos não acumulam
 
     stats.duration = time.perf_counter() - t0
     log.info(

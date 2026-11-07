@@ -56,6 +56,7 @@ class Worktree:
     path: str
     branch: str | None = None
     head: str | None = None
+    head_ts: datetime | None = None  # data do último commit (idade do worktree)
     staged: int = 0
     unstaged: int = 0
     untracked: int = 0
@@ -63,10 +64,16 @@ class Worktree:
     behind: int | None = None
     pr_number: int | None = None
     pr_url: str | None = None
+    forgotten: bool = False  # trabalho não entregue + inativo há muito tempo
 
     @property
     def dirty(self) -> int:
         return self.staged + self.unstaged + self.untracked
+
+    @property
+    def needs_attention(self) -> bool:
+        """Mudanças locais OU commits não enviados — algo a perder."""
+        return self.dirty > 0 or (self.ahead or 0) > 0
 
 
 @dataclass
@@ -94,3 +101,15 @@ class DiscoverResult:
     seen: set[str] = field(default_factory=set)
     skipped: int = 0
     errors: int = 0
+
+
+@dataclass
+class HarnessDiagnosis:
+    """Saída do diagnose() de um scanner — alimenta o `doctor`."""
+
+    name: str
+    found: bool  # a origem do harness existe nesta máquina
+    path: str  # caminho observado
+    files: int  # transcripts encontrados (0 quando não encontrado)
+    note: str | None = None  # observação (dim) ou problema (vermelho)
+    problem: bool = False  # True → o note entra como problema, não como nota

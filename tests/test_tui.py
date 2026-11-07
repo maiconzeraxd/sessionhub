@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from helpers import make_assistant_line, make_user_line, write_transcript
@@ -17,6 +20,7 @@ from sessionhub.db import Database
 from sessionhub.models import Session
 from sessionhub.tui import (
     BackupScreen,
+    DeleteScreen,
     NodeData,
     NoteScreen,
     SessionHubApp,
@@ -24,6 +28,34 @@ from sessionhub.tui import (
 )
 
 SID = "11111111-2222-3333-4444-555555555555"
+
+
+async def _wait_until(
+    pilot: Any, cond: Callable[[], object], timeout: float = 5.0
+) -> None:
+    """Espera determinística: pola a condição processando a fila de mensagens.
+
+    Sleep fixo esperando debounce/to_thread vira flake quando a suíte inteira
+    carrega a máquina (a margem some). Poll termina cedo quando verde e só
+    estoura se a condição REALMENTE não chegou — o assert do chamador reporta.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        await pilot.pause()
+        await asyncio.sleep(0.01)
+
+
+def _session_titles(app: SessionHubApp) -> list[str]:
+    tree = app.query_one("#tree", Tree)
+    return [
+        str(child.data.row["title"])
+        for node in tree.root.children
+        for wt in node.children
+        for child in wt.children
+        if child.data and getattr(child.data, "kind", "") == "session"
+    ]
 
 
 def _fill_db(db: Database, tmp_path: Path) -> None:
@@ -130,17 +162,8 @@ async def test_tui_busca_fuzzy_filtra(
         await pilot.pause()
         search = app.query_one("#search", Input)
         search.value = "cnsr"  # subsequência de "conserta"
-        await asyncio.sleep(0.3)  # debounce da busca
-        await pilot.pause()
-        tree = app.query_one("#tree", Tree)
-        titles = [
-            child.data.row["title"]
-            for node in tree.root.children
-            for wt in node.children
-            for child in wt.children
-            if child.data and getattr(child.data, "kind", "") == "session"
-        ]
-        assert titles == ["conserta scanner"]
+        await _wait_until(pilot, lambda: _session_titles(app) == ["conserta scanner"])
+        assert _session_titles(app) == ["conserta scanner"]
 
 
 async def test_tui_busca_ignora_acentos(
@@ -154,17 +177,8 @@ async def test_tui_busca_ignora_acentos(
         await pilot.pause()
         search = app.query_one("#search", Input)
         search.value = "aplicacao"
-        await asyncio.sleep(0.3)
-        await pilot.pause()
-        tree = app.query_one("#tree", Tree)
-        titles = [
-            child.data.row["title"]
-            for node in tree.root.children
-            for wt in node.children
-            for child in wt.children
-            if child.data and getattr(child.data, "kind", "") == "session"
-        ]
-        assert titles == ["Analisa a aplicação"]
+        await _wait_until(pilot, lambda: _session_titles(app) == ["Analisa a aplicação"])
+        assert _session_titles(app) == ["Analisa a aplicação"]
 
 
 async def test_tui_busca_esconde_worktree_sem_correspondencia(
@@ -200,13 +214,11 @@ async def test_tui_busca_esconde_worktree_sem_correspondencia(
 
         search = app.query_one("#search", Input)
         search.value = "conserta"  # bate só com a sessão da worktree main
-        await asyncio.sleep(0.3)
-        await pilot.pause()
+        await _wait_until(pilot, lambda: wt_count() == 1)
         assert wt_count() == 1  # feat/outra sumiu
 
         search.value = ""  # limpa → tudo volta
-        await asyncio.sleep(0.3)
-        await pilot.pause()
+        await _wait_until(pilot, lambda: wt_count() == 2)
         assert wt_count() == 2
 
 
@@ -217,11 +229,17 @@ async def test_tui_busca_sem_resultado_mostra_aviso(
     app = _app(config, tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
+        tree = app.query_one("#tree", Tree)
         search = app.query_one("#search", Input)
         search.value = "zzzz"
-        await asyncio.sleep(0.3)
-        await pilot.pause()
-        tree = app.query_one("#tree", Tree)
+
+        def _aviso() -> bool:
+            return any(
+                "nenhum resultado" in str(node.label)
+                for node in app._walk_nodes(tree.root)
+            )
+
+        await _wait_until(pilot, _aviso)
         labels = [str(node.label) for node in app._walk_nodes(tree.root)]
         assert any("nenhum resultado" in lbl for lbl in labels), labels
 
@@ -241,8 +259,9 @@ async def test_tui_busca_expande_worktree_colapsada(
 
         search = app.query_one("#search", Input)
         search.value = "conserta"
-        await asyncio.sleep(0.3)
-        await pilot.pause()
+        await _wait_until(
+            pilot, lambda: tree.root.children[0].children[0].is_expanded
+        )
         wt_node = tree.root.children[0].children[0]
         assert wt_node.is_expanded  # a busca expandiu
         session_nodes = [c for c in wt_node.children if c.data and c.data.kind == "session"]
@@ -275,24 +294,14 @@ async def test_tui_esc_limpa_busca(
         app.action_focus_search()
         await pilot.pause()
         search.value = "conserta"
-        await asyncio.sleep(0.3)
-        await pilot.pause()
+        await _wait_until(pilot, lambda: len(_session_titles(app)) == 1)
         await pilot.press("escape")
         await pilot.pause()
         assert search.value == ""
         assert app.query_one("#tree", Tree).has_focus
         # rebuild debounced: as duas sessões voltam
-        await asyncio.sleep(0.3)
-        await pilot.pause()
-        tree = app.query_one("#tree", Tree)
-        titles = [
-            child.data.row["title"]
-            for node in tree.root.children
-            for wt in node.children
-            for child in wt.children
-            if child.data and getattr(child.data, "kind", "") == "session"
-        ]
-        assert len(titles) == 2
+        await _wait_until(pilot, lambda: len(_session_titles(app)) == 2)
+        assert len(_session_titles(app)) == 2
 
 
 async def test_tui_m_marca_e_desmarca_sessao(
@@ -363,13 +372,14 @@ async def test_tui_backup_modal_confirma_e_grava(
         from textual.widgets import Button
 
         modal.query_one("#backup-confirm", Button).press()
-        await asyncio.sleep(0.2)  # to_thread
-        await pilot.pause()
-        assert len(calls) == 1
+        await _wait_until(pilot, lambda: len(calls) == 1)
         rows, dest = calls[0]
         assert {r["session_id"] for r in rows} == {SID, "99999999-2222-3333-4444-555555555555"}
         assert dest == Path(str(config.backup_dir))
-        # evento Backup registrado para as duas
+        # evento Backup registrado (gravado após o to_thread retornar)
+        await _wait_until(
+            pilot, lambda: [e["event"] for e in db.last_events("claude", SID)] == ["Backup"]
+        )
         events = db.last_events("claude", SID)
         assert [e["event"] for e in events] == ["Backup"]
 
@@ -385,6 +395,111 @@ async def test_tui_backup_sem_sessao_nao_abre_modal(
         app.action_backup()
         await pilot.pause()
         assert not isinstance(app.screen, BackupScreen)
+
+
+def _insert_com_transcript(db: Database, tp: Path) -> None:
+    """Sessão cujo transcript existe de verdade (nome = <sid>.jsonl)."""
+    from datetime import datetime
+
+    db.upsert_sessions(
+        [
+            Session(
+                harness="claude",
+                session_id=SID,
+                title="conserta scanner",
+                cwd=str(tp.parent),
+                repo_root=str(tp.parent),
+                worktree_path=str(tp.parent),
+                branch="main",
+                last_activity=datetime.now(UTC),
+                message_count=4,
+                transcript_path=str(tp),
+                resume_command=f"claude --resume {SID}",
+                status="waiting",
+            )
+        ]
+    )
+
+
+async def test_tui_delete_modal_confirma_e_apaga(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    """D abre o modal vermelho com os caminhos exatos; confirmar apaga o
+    transcript do disco, a linha do índice e deixa evento + backup .md."""
+    from textual.widgets import Button, Checkbox, Label
+
+    home = tmp_path / "home"
+    proj = home / ".claude" / "projects" / "G--dev-north"
+    proj.mkdir(parents=True)
+    tp = proj / f"{SID}.jsonl"
+    tp.write_text(
+        '{"type":"user","message":{"role":"user","content":"oi"}}\n', encoding="utf-8"
+    )
+    _insert_com_transcript(db, tp)
+    app = _app(config, tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current_row = db.find_sessions(SID)[0]
+
+        await pilot.press("D")
+        await pilot.pause()
+        assert isinstance(app.screen, DeleteScreen)
+        modal = app.screen
+        assert tp.exists()  # nada é apagado antes de confirmar
+        assert modal.paths == [tp]  # só o transcript desta sessão
+        assert str(tp) in str(modal.query_one("#delete-paths", Label).content)
+        assert modal.query_one("#delete-backup", Checkbox).value is True
+        assert len(app.screen_stack) == 2  # default + modal
+
+        await pilot.press("D")  # modal aberto: D não empilha outro
+        await pilot.pause()
+        assert len(app.screen_stack) == 2
+
+        modal.query_one("#delete-confirm", Button).press()
+        # poll: arquivo apagado + linha do índice + evento (nessa ordem)
+        await _wait_until(pilot, lambda: db.find_sessions(SID) == [])
+
+        assert not tp.exists()  # arquivo REAL apagado
+        events = db.last_events("claude", SID)
+        assert [e["event"] for e in events] == ["Excluída"]
+        assert list(config.backup_dir.rglob("*.md"))  # backup .md gravado antes
+        tree = app.query_one("#tree", Tree)
+        assert app._find_session_node(tree.root, ("claude", SID)) is None
+
+
+async def test_tui_delete_cancelado_nao_apaga(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    from textual.widgets import Button
+
+    tp = tmp_path / f"{SID}.jsonl"
+    tp.write_text("{}\n", encoding="utf-8")
+    _insert_com_transcript(db, tp)
+    app = _app(config, tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current_row = db.find_sessions(SID)[0]
+        await pilot.press("D")
+        await pilot.pause()
+        assert isinstance(app.screen, DeleteScreen)
+        app.screen.query_one("#delete-cancel", Button).press()
+        await pilot.pause()
+        assert not isinstance(app.screen, DeleteScreen)
+        assert tp.exists()  # cancelar não apaga nada
+        assert len(db.find_sessions(SID)) == 1
+
+
+async def test_tui_delete_sem_sessao_nao_abre_modal(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    _fill_db(db, tmp_path)
+    app = _app(config, tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current_row = None
+        app.action_delete_session()
+        await pilot.pause()
+        assert not isinstance(app.screen, DeleteScreen)
 
 
 async def test_tui_tecla_x_arquiva(db: Database, tmp_path: Path, config: Config) -> None:
@@ -483,8 +598,7 @@ async def test_tui_clique_unico_navega_duplo_abre(
         assert opened == []  # mas nada abriu
 
         await tree._on_click(_StubClick(target, 2))  # duplo-clique
-        await asyncio.sleep(0.1)  # abrir roda em thread
-        await pilot.pause()
+        await _wait_until(pilot, lambda: opened == [SID])  # abrir roda em thread
         assert opened == [SID]
 
 
@@ -513,8 +627,7 @@ async def test_tui_clique_unico_mostra_ultimas_mensagens(
         assert target is not None
 
         await tree._on_click(_StubClick(target, 1))  # clique único
-        await asyncio.sleep(0.3)  # debounce do preview
-        await pilot.pause()
+        await _wait_until(pilot, lambda: bool(app._preview_cache))  # debounce
         cached = next(iter(app._preview_cache.values()), "")
         assert "última resposta" in cached
         assert "última pergunta" in cached
@@ -583,19 +696,18 @@ async def test_tui_preview_cacheado(
         await pilot.pause()
         row = db.find_sessions(SID)[0]
         app._update_preview(row)
-        await asyncio.sleep(0.25)
-        await pilot.pause()
+        await _wait_until(pilot, lambda: len(calls) == 1)
         app._update_preview(dict(row))  # mesma sessão
-        await asyncio.sleep(0.25)
-        await pilot.pause()
+        await _wait_until(
+            pilot,
+            lambda: app._preview_task is not None and app._preview_task.done(),
+        )
         assert len(calls) == 1  # cacheou
         # transcript diferente (path) → relê
         row2 = dict(row)
         row2["transcript_path"] = str(tmp_path / "outro.jsonl")
         app._update_preview(row2)
-        await asyncio.sleep(0.25)
-        await pilot.pause()
-        assert len(calls) == 2
+        await _wait_until(pilot, lambda: len(calls) == 2)
 
 
 async def test_tui_rebuild_preserva_colapso(

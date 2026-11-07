@@ -310,6 +310,21 @@ class Database:
                 (1 if hidden else 0, harness, session_id),
             )
 
+    def delete_session(self, harness: str, session_id: str) -> bool:
+        """Apaga a linha da sessão (tecla D — arquivos já removidos do disco).
+
+        Os eventos ficam: "Excluída" na tabela events é a trilha de auditoria
+        de que a sessão existiu. Retorna True se havia linha para apagar.
+        """
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM sessions WHERE harness = ? AND session_id = ?",
+                (harness, session_id),
+            )
+        if cur.rowcount:
+            log.info("delete_session: %s/%s removida do índice", harness, session_id)
+        return bool(cur.rowcount)
+
     def mark_missing(self, harness: str, seen: Iterable[str]) -> int:
         """Sessões cujo transcript não está mais no disco → status 'missing'.
 

@@ -46,6 +46,19 @@ def test_find_sessions_por_prefixo(db: Database) -> None:
     assert db.find_sessions("zzzz") == []
 
 
+def test_delete_session_remove_linha_e_guarda_eventos(db: Database) -> None:
+    """Tecla D: a linha some, o evento "Excluída" fica (trilha)."""
+    db.upsert_sessions([_session(session_id="aaaa1111"), _session(session_id="bbbb2222")])
+    db.record_event("2026-11-07T16:00:00+00:00", "claude", "aaaa1111", "Excluída")
+
+    assert db.delete_session("claude", "aaaa1111") is True
+    assert db.delete_session("claude", "nao-existe") is False
+
+    assert [r["session_id"] for r in db.list_sessions()] == ["bbbb2222"]
+    events = db.last_events("claude", "aaaa1111")
+    assert [e["event"] for e in events] == ["Excluída"]
+
+
 def test_status_counts_e_listagem(db: Database) -> None:
     db.upsert_sessions(
         [

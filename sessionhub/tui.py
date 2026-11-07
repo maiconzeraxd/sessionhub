@@ -6,10 +6,12 @@ pré-visualização (últimas mensagens + git + notas). Filtros por
 abas/teclas 1-4, busca fuzzy ( / ), filtro por harness.
 
 Atalhos: Enter abre a sessão no terminal; n nota; c copia comando de
-retomada; o abre o worktree no editor; x arquiva/oculta; s escaneia;
-? ajuda. Mouse: clique único navega (painel de preview), duplo-clique
-abre. Refresh: watcher opcional (watchdog) dispara scan quente quando
-transcripts mudam; sem ele, assinatura do índice a cada 5s.
+retomada; o abre o worktree no editor; x arquiva/oculta; D exclui a
+sessão de verdade (apaga o transcript do disco, com confirmação e
+backup .md opcional); s escaneia; ? ajuda. Mouse: clique único navega
+(painel de preview), duplo-clique abre. Refresh: watcher opcional
+(watchdog) dispara scan quente quando transcripts mudam; sem ele,
+assinatura do índice a cada 5s.
 """
 
 from __future__ import annotations
@@ -27,12 +29,14 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.markup import escape
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, Markdown, Select, Tree
+from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Markdown, Select, Tree
 
 from .backup import BackupResult, backup_sessions
 from .config import Config, load_config
 from .db import Database
+from .delete import DeleteResult, delete_session_files, session_paths
 from .fmt import age, git_badges, human_size, short_path
 from .log import get_logger
 from .models import STATUS_ICONS
@@ -155,6 +159,8 @@ class HelpScreen(ModalScreen[None]):
   c             copiar comando de retomada
   o             abrir worktree no editor ($EDITOR ou code)
   x             arquivar/ocultar da lista (x de novo desfaz)
+  D             excluir DE VERDADE (apaga o transcript do disco; modal com
+                os caminhos exatos + backup .md opcional — x só arquiva)
 
 [b]Índice[/b]
   s             escanear agora (scanners + git)
@@ -342,6 +348,68 @@ class BackupScreen(ModalScreen[dict[str, Any] | None]):
         self.dismiss({"rows": self.rows, "dest": dest})
 
 
+class DeleteScreen(ModalScreen[dict[str, Any] | None]):
+    """Confirmar a exclusão REAL de uma sessão (tecla D).
+
+    Mostra exatamente o que vai ser apagado do disco — o transcript e a
+    pasta do id, nada além — com um checkbox de backup .md antes (ligado
+    por padrão). O foco começa no Cancelar: Enter no susto cancela, não
+    apaga. Retorna {"row": …, "backup": bool} ou None (cancelado).
+    """
+
+    DEFAULT_CSS = """
+    DeleteScreen { align: center middle; }
+    #delete-box { width: 64; height: auto; max-height: 80%;
+                  border: thick $error; background: $surface; padding: 1 2; }
+    #delete-box Label { width: 1fr; }
+    #delete-paths { height: auto; max-height: 6; overflow-y: auto;
+                    color: $text-muted; }
+    #delete-actions { height: 3; align-horizontal: right; }
+    #delete-box Button { margin: 0 1 0 0; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancelar")]
+
+    def __init__(self, row: dict[str, Any], paths: list[Path]) -> None:
+        super().__init__()
+        self.row = row
+        self.paths = paths
+
+    def compose(self) -> ComposeResult:
+        title = str(self.row.get("title") or self.row.get("session_id") or "?")
+        if len(title) > 52:
+            title = title[:49] + "…"
+        listing = "\n".join(f"  {p}" for p in self.paths)
+        if not listing:
+            listing = "  (nada no disco — só sai do índice)"
+        with Vertical(id="delete-box"):
+            yield Label(f"🗑 excluir [bold]{escape(title)}[/bold] [b red]de verdade[/]?")
+            yield Label("apaga do disco [b]só os arquivos deste id[/b] (nada além):")
+            yield Label(escape(listing), id="delete-paths")
+            yield Label("claude --resume deste id deixa de existir · git e worktree intocados")
+            yield Checkbox(
+                "backup .md antes de apagar (recomendado)", value=True, id="delete-backup"
+            )
+            with Horizontal(id="delete-actions"):
+                yield Button("Excluir", id="delete-confirm", variant="error")
+                yield Button("Cancelar", id="delete-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-cancel", Button).focus()
+
+    @on(Button.Pressed, "#delete-confirm")
+    def _confirm_pressed(self) -> None:
+        backup = self.query_one("#delete-backup", Checkbox).value
+        self.dismiss({"row": self.row, "backup": backup})
+
+    @on(Button.Pressed, "#delete-cancel")
+    def _cancel_pressed(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ------------------------------------------------------------------ app
 
 
@@ -378,6 +446,7 @@ class SessionHubApp(App[None]):
         Binding("m", "toggle_pick", "Marcar"),
         Binding("x", "hide", "Arquivar"),
         Binding("b", "backup", "Backup"),
+        Binding("D", "delete_session", "Excluir"),
         Binding("H", "toggle_hidden_view", "Ocultas"),
     ]
 
@@ -904,6 +973,55 @@ class SessionHubApp(App[None]):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_delete_session(self) -> None:
+        """Excluir a sessão de verdade (D): modal com os caminhos exatos."""
+        if isinstance(self.screen, ModalScreen):
+            return  # modal já aberto — D não empilha outro por cima
+        row = self._current_row
+        if not row:
+            self.notify("selecione uma sessão primeiro", severity="warning")
+            return
+        self.push_screen(
+            DeleteScreen(row, session_paths(row, self.user_home)), self._on_delete_result
+        )
+
+    def _on_delete_result(self, result: dict[str, Any] | None) -> None:
+        if not result:
+            return  # cancelado
+        row = result.get("row")
+        if isinstance(row, dict):
+            asyncio.create_task(self._delete_task(row, bool(result.get("backup"))))
+
+    async def _delete_task(self, row: dict[str, Any], backup: bool) -> None:
+        """Apaga fora do event loop; evento + remoção do índice + rebuild."""
+        try:
+            result = await asyncio.to_thread(
+                delete_session_files,
+                row,
+                self.user_home,
+                Path(str(self.config.backup_dir)),
+                backup,
+            )
+        except Exception as exc:  # noqa: BLE001 - exclusão não derruba a TUI
+            log.exception("exclusão falhou")
+            self.notify(f"exclusão falhou: {exc}", severity="error")
+            return
+        assert isinstance(result, DeleteResult)
+        harness, sid = row["harness"], row["session_id"]
+        with contextlib.suppress(Exception):
+            self._db.record_event(datetime.now(UTC).isoformat(), harness, sid, "Excluída")
+        self._db.delete_session(harness, sid)
+        self._picked.discard((harness, sid))
+        self._current_row = None
+        self.query_one("#preview", Markdown).update("_sessão excluída do disco_")
+        self._rebuild()
+        msg = f"🗑 excluída · {len(result.removed)} caminho(s) do disco"
+        if result.backup_folder is not None:
+            msg += f" · backup em {result.backup_folder}"
+        if result.errors:
+            self.notify("\n".join(result.errors[:3]), severity="warning")
+        self.notify(msg)
 
     def action_scan(self) -> None:
         asyncio.create_task(self._scan_task())

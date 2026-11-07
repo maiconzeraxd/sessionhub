@@ -21,7 +21,7 @@ Fases (a do momento marcada):
 3. ⬜ Monitoramento ao vivo (hooks + psutil): 🟢 rodando / 🟡 esperando você
    (o watcher de transcripts — scan quente na TUI — já está ativo)
 4. 🟡 Backup (primeiro corte pronto: `b` → pasta datada, um `.md` por
-   sessão) + restore + agendamento + age
+   sessão) + excluir (`D`) + restore + agendamento + age
 5. ⬜ Scanners Codex (`.jsonl.zst`), Gemini CLI, Aider + busca full-text FTS5
 6. ⬜ Daemon + notificações + doctor polish
 
@@ -105,6 +105,7 @@ sessionhub doctor                   # diagnóstico de harnesses/ferramentas/term
 | `o` | abrir o worktree no editor (`code .`) |
 | `b` | backup das sessões marcadas — ou da selecionada — em pasta datada |
 | `x` | arquivar/ocultar sessão (reversível com `H`) |
+| `D` | excluir a sessão **de verdade** — apaga o transcript do disco (modal com os caminhos exatos + backup `.md` opcional) |
 | `H` | mostrar/ocultar arquivadas |
 | `s` | re-escanear (dentro da TUI) |
 | `r` | refresh |
@@ -140,6 +141,18 @@ completa** em Markdown, transcrita em streaming (transcripts de GB não
 estouram a memória). Transcript que sumiu vira erro visível, não backup
 silencioso. A escrita acontece **só no destino** — os transcripts dos
 harnesses são apenas lidos.
+
+### Excluir ( `D` )
+
+`x` só arquiva (oculta da lista, reversível). `D` apaga **de verdade**: o
+modal mostra **exatamente** o que vai sumir do disco — o transcript
+`<id>.jsonl` e a pasta `<id>/` (estado do `/rename`) — e nada mais. Todo
+caminho é reconstruído a partir do id e validado antes de remover: a
+pasta do projeto, outros transcripts, `subagents/` e o git do worktree
+nunca são tocados. Um checkbox (ligado por padrão) grava o backup `.md`
+antes de apagar — e se o backup falhar, **nada é apagado**. Confirmar
+remove os arquivos, a linha do índice (o evento "Excluída" fica como
+trilha) e o `claude --resume <id>` deixa de existir.
 
 Refresh: um **watcher** (watchdog) observa `~/.claude/projects` e dispara um
 scan quente quando transcripts mudam (~2s); sem watchdog instalado — ou fora
@@ -204,6 +217,7 @@ sessionhub/
   gitinfo.py      worktree list/status/PRs (paralelo; PRs com cache de 5min)
   preview.py      tail do transcript → markdown
   backup.py       sessões → .md em pasta datada (streaming, conversa completa)
+  delete.py       exclusão real de sessão (só os arquivos do próprio id, validados)
   open.py         resolução+verificação de terminal, montagem do comando
   terminals.py    detecção do terminal atual (env) p/ abertura de sessão
   watcher.py      watchdog → scan quente na TUI quando transcripts mudam
@@ -234,8 +248,12 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
 ### Detalhes que importam
 
 - **Somente leitura nos harnesses**: o SessionHub nunca escreve/move/apaga
-  transcripts. Escrita só em `~/.sessionhub/` (hooks e backup, quando
-  existirem, são as únicas exceções confirmadas).
+  transcripts. Exceção única e deliberada: a tecla `D`, com confirmação —
+  apaga **só os arquivos da própria sessão** (transcript + pasta do id,
+  reconstruídos a partir do id e validados), com backup `.md` opcional e
+  modal listando cada caminho. Fora isso, escrita só em `~/.sessionhub/`
+  (e no destino de backup configurado; hooks na fase 3, com backup do
+  original).
 - **Incremental**: cada transcript tem fingerprint (mtime+size) no índice;
   inalterado não é relido. 366 transcripts / 2,4GB: scan completo ~10s,
   warm ~0,9s.
@@ -266,7 +284,7 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
 ```bash
 uv pip install -e ".[dev]" --python .venv/Scripts/python.exe  # Windows
 uv pip install -e ".[dev]" --python .venv/bin/python          # Linux/macOS
-python -m pytest      # 159 testes (fixtures sintéticas em tmp; nada real)
+python -m pytest      # 171 testes (fixtures sintéticas em tmp; nada real)
 python -m ruff check .
 python -m mypy
 ```

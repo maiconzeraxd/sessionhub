@@ -1,0 +1,238 @@
+"""Testes do scanner do Claude Code (fixtures sintéticas)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from helpers import (
+    make_assistant_line,
+    make_meta_line,
+    make_summary_line,
+    make_user_line,
+    write_transcript,
+)
+
+from sessionhub.scanners.claude import ClaudeScanner
+
+SID = "11111111-2222-3333-4444-555555555555"
+
+
+def test_parses_sessao_basica(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_meta_line(SID),
+            make_user_line(
+                SID,
+                "G:\\proj",
+                "<local-command-caveat>xyz</local-command-caveat>",
+                ts="2026-11-01T10:00:00.000Z",
+                meta=True,
+            ),
+            make_user_line(
+                SID, "G:\\proj", "consertar o pipeline de build", ts="2026-11-01T10:00:01.000Z"
+            ),
+            make_assistant_line(SID, "G:\\proj", "ok, vou ver", ts="2026-11-01T10:01:00.000Z"),
+            make_user_line(SID, "G:\\proj", "obrigado", ts="2026-11-01T10:02:00.000Z"),
+        ],
+    )
+    scanner = ClaudeScanner(fake_home)
+    result = scanner.discover()
+    assert len(result.sessions) == 1
+    s = result.sessions[0]
+    assert s.harness == "claude"
+    assert s.session_id == SID
+    assert s.title == "consertar o pipeline de build"
+    assert s.message_count == 3  # 2 user reais + 1 assistant (meta não conta)
+    assert s.cwd == "G:\\proj"
+    assert s.branch == "main"
+    assert s.created_at is not None and s.created_at.year == 2026
+    assert s.last_activity is not None and s.last_activity.minute == 2
+    assert s.resume_command == f"claude --resume {SID}"
+    assert s.transcript_path == str(projects / f"{SID}.jsonl")
+
+
+def test_comando_local_nao_vira_titulo(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_user_line(
+                SID,
+                "G:\\proj",
+                "<command-name>/clear</command-name>\n...",
+                ts="2026-11-01T10:00:00.000Z",
+            ),
+            make_user_line(SID, "G:\\proj", "oi, tudo bem?", ts="2026-11-01T10:00:05.000Z"),
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title == "oi, tudo bem?"
+
+
+def test_titulo_usa_summary_como_fallback(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_summary_line("Refatora módulo de scan"),
+            make_meta_line(SID),
+            {"type": "cost-state", "sessionId": SID, "totalCostUSD": 0},
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title == "Refatora módulo de scan"
+    assert s.message_count == 0
+
+
+def test_linhas_corrompidas_sao_puladas(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            "isto não é json {{{",
+            json.dumps(make_user_line(SID, "G:\\proj", "msg boa")),
+            "outra linha quebrada ]]]",
+            json.dumps(make_assistant_line(SID, "G:\\proj", "ok", "2026-11-01T10:01:00.000Z")),
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.message_count == 2
+    assert s.title == "msg boa"
+
+
+def test_titulo_longue_e_truncado(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [make_user_line(SID, "G:\\proj", "a" * 200)],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title is not None and len(s.title) == 80
+
+
+def test_transcript_sem_mensagens_reais(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_meta_line(SID),
+            {"type": "cost-state", "sessionId": SID, "totalCostUSD": 0},
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title is None
+    assert s.session_id == SID  # fallback: stem do arquivo
+    assert s.last_activity is not None  # do mtime do arquivo
+
+
+def test_gitbranch_head_e_ignorada(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [make_user_line(SID, "G:\\proj", "x", branch="HEAD")],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.branch is None
+
+
+def test_incremental_pula_inalterados(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    fp = write_transcript(projects / f"{SID}.jsonl", [make_user_line(SID, "G:\\proj", "x")])
+    scanner = ClaudeScanner(fake_home)
+    first = scanner.discover()
+    assert first.skipped == 0 and len(first.sessions) == 1
+
+    stat = fp.stat()
+    second = scanner.discover(fingerprints={str(fp): (stat.st_mtime, stat.st_size)})
+    assert second.skipped == 1
+    assert second.sessions == []
+    assert str(fp) in second.seen
+
+
+def test_diretorio_ausente(fake_home: Path) -> None:
+    scanner = ClaudeScanner(fake_home / "nao-existe")
+    assert scanner.discover().sessions == []
+
+
+def test_cwd_usa_ultimo_valor(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_user_line(SID, "G:\\proj", "começa", ts="2026-11-01T10:00:00.000Z"),
+            make_user_line(SID, "G:\\outro", "termina", ts="2026-11-01T11:00:00.000Z"),
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.cwd == "G:\\outro"
+
+
+def test_transcript_de_subagente_e_ignorado(fake_home: Path) -> None:
+    """Sidechains (subagents/) não são sessões — não entram no índice."""
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [make_user_line(SID, "G:\\proj", "sessão principal")],
+    )
+    write_transcript(
+        projects / "subagents" / "agent-abc.jsonl",
+        [make_user_line(SID, "G:\\proj", "sou um subagente")],  # sessionId = o da pai
+    )
+    result = ClaudeScanner(fake_home).discover()
+    assert len(result.sessions) == 1
+    assert result.sessions[0].title == "sessão principal"
+
+
+def test_dedup_mesmo_session_id_fica_o_mais_recente(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [make_user_line(SID, "G:\\proj", "antigo", ts="2026-11-01T10:00:00.000Z")],
+    )
+    write_transcript(
+        projects / f"{SID}-continua.jsonl",
+        [make_user_line(SID, "G:\\proj", "novo", ts="2026-11-02T10:00:00.000Z")],
+    )
+    result = ClaudeScanner(fake_home).discover()
+    assert len(result.sessions) == 1
+    assert result.sessions[0].title == "novo"
+
+
+def test_titulo_desembrulha_pasted_content(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_user_line(
+                SID,
+                "G:\\proj",
+                '<pasted_content id="2f8a">\n'
+                "InitializeDriver: begin\nmap_fuse_driver: begin\n</pasted_content>",
+                ts="2026-11-01T10:00:00.000Z",
+            )
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title is not None
+    assert s.title.startswith("InitializeDriver: begin")
+
+
+def test_titulo_remove_system_reminder(fake_home: Path) -> None:
+    projects = fake_home / ".claude" / "projects" / "G--proj"
+    write_transcript(
+        projects / f"{SID}.jsonl",
+        [
+            make_user_line(
+                SID,
+                "G:\\proj",
+                "<system-reminder>contexto interno</system-reminder> analisa esse dump",
+                ts="2026-11-01T10:00:00.000Z",
+            )
+        ],
+    )
+    s = ClaudeScanner(fake_home).discover().sessions[0]
+    assert s.title is not None
+    assert s.title.startswith("analisa esse dump")

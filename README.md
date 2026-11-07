@@ -26,44 +26,54 @@ Fases (a do momento marcada):
 
 ## Instalação
 
-Plataformas: **Windows**, **Linux** e **macOS**. Requisitos: Python 3.11+,
-git no PATH. (uv recomendado; o venv não precisa de pip.)
+Plataformas: **Windows**, **Linux** e **macOS**. Requisitos: Python 3.11+ e
+git no PATH (worktrees e PRs). Nada mais — o terminal é detectado na hora
+(Windows Terminal, kitty, wezterm, tmux, iTerm, gnome-terminal, …).
 
-Windows (PowerShell):
+Em qualquer máquina:
 
-```powershell
-cd G:\_IA\Aplicação
-uv venv
-uv pip install -e ".[dev]" --python .venv\Scripts\python.exe
-.venv\Scripts\sessionhub.exe --help
+```bash
+git clone https://github.com/maiconzeraxd/sessionhub.git
+cd sessionhub
 ```
 
-Linux/macOS:
+Com [uv](https://docs.astral.sh/uv/) (recomendado — o venv não precisa de pip):
 
 ```bash
 uv venv
-uv pip install -e ".[dev]" --python .venv/bin/python
-.venv/bin/sessionhub --help
+uv pip install -e . --python .venv/bin/python          # Linux/macOS
+uv pip install -e . --python .venv/Scripts/python.exe  # Windows
 ```
 
-Ou com pip/pipx em qualquer máquina: `pipx install .`.
+Ou com o pip do Python:
 
-> **Gotcha (uv + pasta com acento):** em caminhos com caracteres não-ASCII
-> (este projeto: `G:\_IA\Aplicação`), o editable install do uv grava o `.pth`
-> com encoding errado e o `import sessionhub` falha fora do diretório do
-> projeto. Correção de 1 linha — reescreva
-> `.venv\Lib\site-packages\_editable_impl_sessionhub.pth` com:
+```bash
+python -m venv .venv
+.venv/bin/pip install -e .        # Linux/macOS
+.venv\Scripts\pip install -e .    # Windows
+```
+
+O executável fica no venv (`sessionhub`; `python -m sessionhub` também
+funciona). Instalação global isolada:
+`pipx install git+https://github.com/maiconzeraxd/sessionhub.git`.
+
+> **Gotcha (uv + pasta com acento):** se o caminho do projeto contém
+> caracteres não-ASCII (acentos, "ç", CJK…), o editable install do uv grava
+> o `.pth` com encoding errado e o `import sessionhub` falha fora do
+> diretório do projeto. Correção de 1 linha — reescreva
+> `.venv/Lib/site-packages/_editable_impl_sessionhub.pth`
+> (Linux/macOS: `.venv/lib/python3.11/site-packages/…`) com:
 >
 > ```text
 > import sys, os; _p = os.path.dirname(sys.prefix); sys.path.insert(0, _p) if (_p not in sys.path and os.path.isdir(os.path.join(_p, "sessionhub"))) else None
 > ```
 >
 > (ASCII puro, deriva o caminho do `sys.prefix` — imune ao encoding.) Uma
-> instalação normal (`pipx install .`) não tem esse problema.
+> instalação com pip/pipx não tem esse problema.
 
 ## Uso
 
-```powershell
+```text
 sessionhub            # abre a TUI (ou `python -m sessionhub`)
 sessionhub scan       # atualiza o índice (incremental; --full = reparse tudo)
 sessionhub ls         # tabela no terminal
@@ -86,7 +96,7 @@ sessionhub doctor                   # diagnóstico de harnesses/ferramentas/term
 | **duplo-clique** | abrir a sessão num terminal novo, no worktree dela |
 | `Enter` | abrir a sessão (igual ao duplo-clique) |
 | `1 2 3 4` | filtros: Ativas · Esperando você · Esquecidas · Todas |
-| `/` | busca fuzzy (título, branch, caminho, session_id) |
+| `/` | busca fuzzy — título, branch, session_id, nota… (aceita sem acento); `Enter` volta pra árvore, `Esc` limpa |
 | `Tab` | alternar foco árvore ↔ busca |
 | `n` | adicionar/editar nota 📌 e tags da sessão |
 | `c` | copiar o comando de retomada |
@@ -132,7 +142,7 @@ da lista; abrir nunca falha em silêncio. No Windows Terminal, o comando
 gerado é:
 
 ```
-wt.exe -d G:\Dev\North cmd /k claude --resume <id>
+wt.exe -d <caminho-do-worktree> cmd /k claude --resume <id>
 ```
 
 Personalize no `config.toml`:
@@ -227,9 +237,10 @@ Builtin (fase 1): `claude`. Fase 5: `codex` (.jsonl.zst), `gemini`, `aider`,
 
 ## Desenvolvimento
 
-```powershell
-uv pip install -e ".[dev]" --python .venv\Scripts\python.exe
-python -m pytest      # 141 testes (fixtures sintéticas em tmp; nada real)
+```bash
+uv pip install -e ".[dev]" --python .venv/Scripts/python.exe  # Windows
+uv pip install -e ".[dev]" --python .venv/bin/python          # Linux/macOS
+python -m pytest      # 148 testes (fixtures sintéticas em tmp; nada real)
 python -m ruff check .
 python -m mypy
 ```

@@ -60,6 +60,19 @@ def _app(config: Config) -> SessionHubApp:
     return SessionHubApp(config=config)
 
 
+def test_fold_e_search_matches() -> None:
+    """Dobra de acentos + subsequência (curto) vs substring (caminho)."""
+    from sessionhub.tui import _fold, _search_matches
+
+    assert _fold("Aplicação ÇÃ") == "aplicacao ca"
+    assert _search_matches("cnsr", "conserta scanner", "")  # subsequência no curto
+    assert _search_matches("aplicacao", "Analisa a Aplicação", "g:/x")  # sem acento
+    assert _search_matches("north", "", "g:/dev/north/wt-a")  # substring no caminho
+    # subsequência solta NÃO vale para caminho (senão casa com tudo)
+    assert not _search_matches("nrt", "", "g:/dev/north")
+    assert not _search_matches("zzz", "conserta scanner", "g:/dev/north")
+
+
 async def test_tui_monta_arvore_com_sessoes(db: Database, tmp_path: Path, config: Config) -> None:
     _fill_db(db, tmp_path)
     app = _app(config)
@@ -106,7 +119,7 @@ async def test_tui_busca_fuzzy_filtra(
     async with app.run_test() as pilot:
         await pilot.pause()
         search = app.query_one("#search", Input)
-        search.value = "cnsle"  # subsequência de "conserta scanner"
+        search.value = "cnsr"  # subsequência de "conserta"
         await asyncio.sleep(0.3)  # debounce da busca
         await pilot.pause()
         tree = app.query_one("#tree", Tree)
@@ -118,6 +131,158 @@ async def test_tui_busca_fuzzy_filtra(
             if child.data and getattr(child.data, "kind", "") == "session"
         ]
         assert titles == ["conserta scanner"]
+
+
+async def test_tui_busca_ignora_acentos(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    """Digitar sem acento acha título com acento (pt-BR: 'aplicacao' → 'Aplicação')."""
+    _fill_db(db, tmp_path)
+    db.update_titles("claude", {str(tmp_path / "t.jsonl"): "Analisa a aplicação"})
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "aplicacao"
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        tree = app.query_one("#tree", Tree)
+        titles = [
+            child.data.row["title"]
+            for node in tree.root.children
+            for wt in node.children
+            for child in wt.children
+            if child.data and getattr(child.data, "kind", "") == "session"
+        ]
+        assert titles == ["Analisa a aplicação"]
+
+
+async def test_tui_busca_esconde_worktree_sem_correspondencia(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    """Durante a busca, worktree sem sessão/branch/caminho correspondente sai
+    da árvore — senão a busca nunca estreia nada e parece morta."""
+    _fill_db(db, tmp_path)
+    from datetime import datetime
+
+    from sessionhub.models import Worktree
+
+    now = datetime.now(UTC)
+    outro = str(tmp_path / "wt-outro")
+    db.replace_worktrees(
+        str(tmp_path),
+        [
+            Worktree(repo_root=str(tmp_path), path=str(tmp_path), branch="main", head_ts=now),
+            Worktree(
+                repo_root=str(tmp_path), path=outro, branch="feat/outra", head_ts=now
+            ),
+        ],
+    )
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tree = app.query_one("#tree", Tree)
+
+        def wt_count() -> int:
+            return sum(len(node.children) for node in tree.root.children)
+
+        assert wt_count() == 2  # sem busca: main + feat/outra
+
+        search = app.query_one("#search", Input)
+        search.value = "conserta"  # bate só com a sessão da worktree main
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        assert wt_count() == 1  # feat/outra sumiu
+
+        search.value = ""  # limpa → tudo volta
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        assert wt_count() == 2
+
+
+async def test_tui_busca_sem_resultado_mostra_aviso(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    _fill_db(db, tmp_path)
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "zzzz"
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        tree = app.query_one("#tree", Tree)
+        labels = [str(node.label) for node in app._walk_nodes(tree.root)]
+        assert any("nenhum resultado" in lbl for lbl in labels), labels
+
+
+async def test_tui_busca_expande_worktree_colapsada(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    """Resultado dentro de worktree colapsada precisa aparecer (a busca
+    não restaura o colapso)."""
+    _fill_db(db, tmp_path)
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tree = app.query_one("#tree", SessionTree)
+        tree.root.children[0].children[0].collapse()
+        await pilot.pause()
+
+        search = app.query_one("#search", Input)
+        search.value = "conserta"
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        wt_node = tree.root.children[0].children[0]
+        assert wt_node.is_expanded  # a busca expandiu
+        session_nodes = [c for c in wt_node.children if c.data and c.data.kind == "session"]
+        assert session_nodes  # e o resultado está visível
+
+
+async def test_tui_enter_na_busca_volta_foco_pro_tree(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    _fill_db(db, tmp_path)
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_focus_search()
+        await pilot.pause()
+        assert app.query_one("#search", Input).has_focus
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#tree", Tree).has_focus
+
+
+async def test_tui_esc_limpa_busca(
+    db: Database, tmp_path: Path, config: Config
+) -> None:
+    _fill_db(db, tmp_path)
+    app = _app(config)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        app.action_focus_search()
+        await pilot.pause()
+        search.value = "conserta"
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert search.value == ""
+        assert app.query_one("#tree", Tree).has_focus
+        # rebuild debounced: as duas sessões voltam
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        tree = app.query_one("#tree", Tree)
+        titles = [
+            child.data.row["title"]
+            for node in tree.root.children
+            for wt in node.children
+            for child in wt.children
+            if child.data and getattr(child.data, "kind", "") == "session"
+        ]
+        assert len(titles) == 2
 
 
 async def test_tui_tecla_x_arquiva(db: Database, tmp_path: Path, config: Config) -> None:

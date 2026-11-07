@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,13 +86,37 @@ class SessionTree(Tree[NodeData]):
         self.cursor_line = line  # highlight → preview, sem abrir
 
 
+def _fold(text: str) -> str:
+    """Minúsculas sem acento: 'Aplicação' → 'aplicacao'.
+
+    A busca aceita digitar sem acento (teclado/layout), normalizando os
+    dois lados (query e texto do índice).
+    """
+    decomposed = unicodedata.normalize("NFD", text.lower())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def _fuzzy(query: str, text: str) -> bool:
-    """Match de subsequência (a la fzf, versão simples)."""
-    q = query.lower().strip()
+    """Match de subsequência (a la fzf, versão simples), sem acento."""
+    q = _fold(query).strip()
     if not q:
         return True
-    iterator = iter(text.lower())
+    iterator = iter(_fold(text))
     return all(ch in iterator for ch in q)
+
+
+def _search_matches(query: str, short: str, paths: str) -> bool:
+    """Query casa por subsequência nos campos curtos (título, branch, id…)
+    OU por substring nos caminhos (worktree, cwd, repo).
+
+    Subsequência em caminho longo casa com quase qualquer query (as letras
+    aparecem em sequência em algum lugar do caminho) — a busca "filtra"
+    sem esconder nada. Por isso caminho só aceita substring.
+    """
+    if _fuzzy(query, short):
+        return True
+    q = _fold(query).strip()
+    return bool(q) and q in _fold(paths)
 
 
 # ------------------------------------------------------------------ modais
@@ -110,7 +135,9 @@ class HelpScreen(ModalScreen[None]):
 [b]Navegação[/b]
   ↑/↓           mover · Enter abrir/expandir
   1..4          Ativas · Esperando você · Esquecidas · Todas
-  /             busca fuzzy (títulos/branch/caminho)
+  /             busca fuzzy (título/branch/caminho, sem acento)
+  Enter         busca: volta o foco pra árvore (filtro continua)
+  Esc           busca: limpa e volta pra árvore
   Tab           alternar foco (árvore ↔ busca)
 
 [b]Mouse[/b]
@@ -390,13 +417,22 @@ class SessionHubApp(App[None]):
         if self.harness_filter and row.get("harness") != self.harness_filter:
             return False
         if self.search:
-            hay = " ".join(
+            short = " ".join(
                 str(row.get(k) or "")
-                for k in ("title", "session_id", "branch", "worktree_path", "cwd")
+                for k in ("title", "session_id", "branch", "note", "tags")
             )
-            if not _fuzzy(self.search, hay):
+            paths = " ".join(
+                str(row.get(k) or "") for k in ("worktree_path", "cwd", "repo_root")
+            )
+            if not _search_matches(self.search, short, paths):
                 return False
         return True
+
+    def _wt_matches_search(self, wt: dict[str, Any]) -> bool:
+        """Worktree sem sessões ainda aparece se o branch/caminho bate."""
+        short = str(wt.get("branch") or "")
+        paths = f"{wt.get('path') or ''} {wt.get('repo_root') or ''}"
+        return _search_matches(self.search, short, paths)
 
     # ------------------------------------------------------------ árvore
 
@@ -409,17 +445,20 @@ class SessionHubApp(App[None]):
             rows = []
         self._worktrees = {w["path"]: w for w in self._db.list_worktrees()}
         sessions = [r for r in rows if self._row_matches(r)]
+        searching = bool(self.search.strip())
 
         selected: tuple[str, str] | None = None
         if self._current_row:
             selected = (self._current_row["harness"], self._current_row["session_id"])
 
         # preserva o estado visual: worktrees colapsadas + rolagem
+        # (durante a busca NÃO preserva: resultados novos precisam aparecer,
+        #  e o scroll da árvore completa não significa nada na filtrada)
         collapsed, scroll_y = self._tree_state(tree)
         tree.clear()
         root = tree.root
 
-        if not sessions and not self._worktrees:
+        if not rows and not self._worktrees:
             root.add(
                 "índice vazio — aperte [bold]s[/bold] para escanear",
                 data=NodeData("placeholder"),
@@ -434,7 +473,9 @@ class SessionHubApp(App[None]):
             key = row.get("worktree_path") or f"cwd::{row.get('cwd') or ''}"
             by_key.setdefault(key, []).append(row)
 
-        # repos: das sessões + da tabela de worktrees (worktree sem sessão entra)
+        # repos: das sessões + da tabela de worktrees (worktree sem sessão entra).
+        # Durante a busca o worktree sem sessão/branch/caminho correspondente
+        # fica de fora — senão a árvore nunca estreia e a busca parece morta.
         repo_wt_keys: dict[str, set[str]] = {}
         repo_latest: dict[str, str] = {}
         for row in sessions:
@@ -446,11 +487,23 @@ class SessionHubApp(App[None]):
                 repo_latest[repo] = ts
         for wt in self._worktrees.values():
             repo = wt.get("repo_root") or "(sem repositório)"
+            if searching and not by_key.get(wt["path"]) and not self._wt_matches_search(wt):
+                continue
             repo_wt_keys.setdefault(repo, set()).add(wt["path"])
             # worktrees sem sessão: usam o commit mais recente como atividade
             ts = wt.get("head_ts") or wt.get("scanned_at") or ""
             if ts > repo_latest.get(repo, ""):
                 repo_latest[repo] = ts
+
+        if not repo_wt_keys:
+            root.add(
+                f"nenhum resultado para [bold]{self.search.strip()}[/bold]"
+                " — [bold]Esc[/bold] limpa a busca",
+                data=NodeData("placeholder"),
+                expand=False,
+            )
+            self._update_summary()
+            return
 
         def _wt_sort(key: str) -> str:
             wt_rows = by_key.get(key, [])
@@ -480,12 +533,12 @@ class SessionHubApp(App[None]):
                     )
         root.expand()
 
-        if collapsed:
+        if collapsed and not searching:
             for node in self._walk_nodes(root):
                 if str(node.label) in collapsed:
                     with contextlib.suppress(Exception):
                         node.collapse()
-        if scroll_y > 0:
+        if scroll_y > 0 and not searching:
             with contextlib.suppress(Exception):
                 tree.scroll_to(y=scroll_y, animate=False)
 
@@ -613,6 +666,27 @@ class SessionHubApp(App[None]):
         except asyncio.CancelledError:
             return  # tecla nova chegou
         self._rebuild()
+
+    @on(Input.Submitted, "#search")
+    def _search_submitted(self, event: Input.Submitted) -> None:
+        """Enter na busca: mantém o filtro e devolve o foco à árvore."""
+        event.stop()
+        self.query_one("#tree", Tree).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        """Esc na caixa de busca: limpa o filtro e volta pra árvore.
+
+        (O Input não consome Esc — o evento borbulha até aqui. Modais têm
+        binding próprio de Esc e fecham antes de chegar neste handler.)
+        """
+        if event.key != "escape":
+            return
+        focused = self.focused
+        if isinstance(focused, Input) and focused.id == "search":
+            event.stop()
+            event.prevent_default()
+            focused.value = ""  # dispara Changed → rebuild (debounced)
+            self.query_one("#tree", Tree).focus()
 
     @on(Select.Changed, "#harness-select")
     def _harness_changed(self, event: Select.Changed) -> None:
